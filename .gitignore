@@ -1,0 +1,86 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+electron/node_modules/
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build output
+build/
+dist/
+frontend/build/
+backend/build/
+backend/dist/
+electron/dist/
+coverage/
+
+# Runtime bundles and third-party binaries
+mongodb-portable/
+electron/installer/vc_redist*.exe
+*.exe
+*.msi
+
+# Runtime data and local server files
+scum_configs/
+LGSSManagers/
+logs/
+*.log
+dump.rdb
+
+# Secrets and local configuration
+.env
+.env.*
+*.env
+.env.example
+*.pem
+*.key
+*token.json*
+*credentials.json*
+credentials.json
+.credentials
+
+# Local maintainer tooling and private notes
+*.bat
+*.ps1
+scripts/
+backend/tests/
+INSTALL.md
+BUILD_GUIDE_TR.md
+frontend/README.md
+electron/README.md
+memory/
+test_reports/
+test_result.md
+design_guidelines.json
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Package manager caches
+.pnp
+.pnp.js
+.yarn/install-state.gz
+.yarn/cache/
+.cache/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Archives and heavy artifacts
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z

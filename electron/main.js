@@ -1,0 +1,911 @@
+// LGSS Managers - Electron main process
+// Full standalone bundle: spawns portable MongoDB + PyInstaller-packaged backend
+// + loads the React frontend. Zero dependencies on the target machine.
+
+const { app, BrowserWindow, ipcMain, dialog, shell, globalShortcut } = require('electron');
+// electron-updater is loaded lazily so updater support can fail closed.
+let autoUpdater = null;
+function getAutoUpdater() {
+  if (autoUpdater) return autoUpdater;
+  try {
+    ({ autoUpdater } = require('electron-updater'));
+    autoUpdater.autoDownload = false;
+    autoUpdater.autoInstallOnAppQuit = true;
+    return autoUpdater;
+  } catch (e) {
+    console.warn('[updater] electron-updater not available:', e.message);
+    return null;
+  }
+}
+
+// ---------- Compatibility switches for Windows Server / RDP / no-GPU hosts ----
+// Servers (Windows Server 2019/2022) do not have full GPU drivers and Electron's
+// default hardware-accelerated rendering crashes silently on them. We also see
+// the same failure in some RDP sessions. Disabling GPU acceleration makes the
+// renderer use a software path that works everywhere.
+app.disableHardwareAcceleration();
+app.commandLine.appendSwitch('disable-gpu');
+app.commandLine.appendSwitch('disable-software-rasterizer');
+app.commandLine.appendSwitch('disable-gpu-compositing');
+app.commandLine.appendSwitch('no-sandbox');
+const path = require('path');
+const fs = require('fs');
+const http = require('http');
+const { spawn, execFile } = require('child_process');
+const os = require('os');
+
+let mainWindow;
+let splashWindow = null;
+let backendProcess = null;
+let mongodProcess = null;
+
+const BACKEND_PORT = Number(process.env.BACKEND_PORT || 8001);
+const BACKEND_HOST = '127.0.0.1';
+const BACKEND_URL = `http://${BACKEND_HOST}:${BACKEND_PORT}`;
+const MONGO_PORT = 27017;
+const MONGO_HOST = '127.0.0.1';
+
+function getResourcesBase() {
+  // Packaged: files are under process.resourcesPath
+  // Dev: files are under project root
+  if (app.isPackaged) return process.resourcesPath;
+  return path.join(__dirname, '..');
+}
+
+function getUserDataDir(sub = 'logs') {
+  const dir = path.join(app.getPath('userData'), sub);
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+/**
+ * Locate the Manager's Globalization folder.
+ *
+ * In a packaged install the user wants this NEXT TO the .exe, e.g.
+ *   C:\Program Files\LGSS\LGSS Manager\Globalization\
+ *
+ * Electron's `process.resourcesPath` points to the `resources/` subfolder of
+ * the install dir, so the parent is the install root.
+ *
+ * The folder is created on first boot and exposed to the backend as
+ * `LGSS_GLOBALIZATION_DIR`.
+ */
+function getGlobalizationDir() {
+  let base;
+  let resourcesDir = null;
+  if (app.isPackaged) {
+    // process.resourcesPath = <install_dir>/resources
+    // → parent = <install_dir> = C:\Program Files\LGSS\LGSS Manager
+    base = path.dirname(process.resourcesPath);
+    resourcesDir = path.join(process.resourcesPath, 'Globalization');
+  } else {
+    // Dev: <project_root>/Globalization
+    base = path.join(__dirname, '..');
+  }
+  const gdir = path.join(base, 'Globalization');
+  try {
+    fs.mkdirSync(gdir, { recursive: true });
+
+    // Copy bundled translations from extraResources to user's Globalization directory in production
+    if (resourcesDir && fs.existsSync(resourcesDir)) {
+      try {
+        const files = fs.readdirSync(resourcesDir);
+        for (const file of files) {
+          const src = path.join(resourcesDir, file);
+          const dest = path.join(gdir, file);
+          if (fs.statSync(src).isFile() && file.endsWith('.xaml')) {
+            fs.copyFileSync(src, dest);
+          }
+        }
+      } catch (err) {
+        console.warn('[i18n] failed to copy bundled translations:', err);
+      }
+    }
+
+    const readme = path.join(gdir, 'README.txt');
+    if (!fs.existsSync(readme)) {
+      fs.writeFileSync(readme,
+        'LGSS Manager — Custom Language Drop-in Folder\r\n' +
+        '==============================================\r\n\r\n' +
+        'Drop community-translated .xaml files here. The Manager will\r\n' +
+        'scan this folder on startup and whenever you click "Reload\r\n' +
+        'Languages" in the language picker.\r\n\r\n' +
+        'Workflow:\r\n' +
+        '  1. Open the Manager and pick the language icon (top-right).\r\n' +
+        '  2. Click "EN · Template" to download `en.xaml`.\r\n' +
+        '  3. Open it in Notepad/VS Code, translate every <sys:String>\r\n' +
+        '     body into your language.\r\n' +
+        '  4. Rename to your ISO language code (e.g. `pl.xaml`, `ja.xaml`).\r\n' +
+        '  5. Drop the file in THIS folder.\r\n' +
+        '  6. Click "Reload Languages" — your language appears in the\r\n' +
+        '     picker right next to the built-ins.\r\n\r\n' +
+        'Once you are happy with the translation, send the .xaml file to\r\n' +
+        'LGSS so we can bundle it in the next release for everyone.\r\n',
+        'utf-8');
+    }
+  } catch (e) {
+    console.warn('[i18n] could not create Globalization folder:', e);
+  }
+  return gdir;
+}
+
+function logDir() { return getUserDataDir('logs'); }
+function closeFdQuietly(fd) {
+  if (typeof fd !== 'number') return;
+  try { fs.closeSync(fd); } catch (_) {}
+}
+function mongoDbPath() {
+  // Use ProgramData (machine-wide writable dir) — avoids per-user % APPDATA
+  // permission issues when the app runs elevated, and keeps DB in one place
+  // across Windows user accounts.
+  const dir = path.join(
+    process.env.ProgramData || path.join('C:', 'ProgramData'),
+    'LGSS Manager', 'mongo-db'
+  );
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (_) {}
+  return dir;
+}
+
+// ---------- Admin elevation ----------
+async function requireAdminOrExit() {
+  // In dev mode (run via `npm run dev` with ELECTRON_START_URL set), skip
+  // elevation entirely — the mock disk/filesystem calls do not need admin.
+  // Production installer sets `requestedExecutionLevel: requireAdministrator`
+  // in package.json so Windows itself handles UAC for the packaged .exe.
+  if (process.env.ELECTRON_START_URL) {
+    console.log('[admin] dev mode — skipping admin elevation check');
+    return;
+  }
+  try {
+    const isElevated = (await import('is-elevated')).default;
+    const elevated = await isElevated();
+    if (!elevated) {
+      const result = dialog.showMessageBoxSync({
+        type: 'question',
+        title: 'Yönetici olarak çalıştır',
+        message: 'Bu uygulama, TÜM işlevlere erişim için yönetici ayrıcalıklarına ihtiyaç duyar. Yönetici olarak çalıştırmak ister misiniz?',
+        buttons: ['Evet', 'Hayır'],
+        defaultId: 0,
+        cancelId: 1,
+      });
+      if (result === 0) {
+        const sudo = require('sudo-prompt');
+        const exe = process.execPath;
+        const args = process.argv.slice(1).join(' ');
+        sudo.exec(`"${exe}" ${args}`, { name: 'LGSS Managers' }, () => {});
+        app.exit(0);
+      } else {
+        app.exit(0);
+      }
+    }
+  } catch (e) {
+    console.warn('admin check skipped:', e.message);
+  }
+}
+
+// ---------- MongoDB portable spawn ----------
+function getMongodExe() {
+  const base = getResourcesBase();
+  // Packaged layout:  resources/mongodb/bin/mongod.exe
+  // Dev layout:       ../mongodb-portable/bin/mongod.exe  OR  ../mongodb/bin/mongod.exe
+  const paths = [
+    path.join(base, 'mongodb', 'bin', 'mongod.exe'),
+    path.join(base, 'mongodb-portable', 'bin', 'mongod.exe'),
+  ];
+  for (const p of paths) {
+    if (fs.existsSync(p)) return p;
+  }
+  return null; // caller falls back to system service
+}
+
+async function isMongoReachable() {
+  return new Promise((resolve) => {
+    const sock = require('net').createConnection({ host: MONGO_HOST, port: MONGO_PORT });
+    let done = false;
+    const finish = (ok) => {
+      if (done) return;
+      done = true;
+      try { sock.destroy(); } catch (_) {}
+      resolve(ok);
+    };
+    sock.setTimeout(800);
+    sock.once('connect', () => finish(true));
+    sock.once('timeout', () => finish(false));
+    sock.once('error', () => finish(false));
+  });
+}
+
+async function spawnMongodIfNeeded() {
+  if (await isMongoReachable()) {
+    console.log('[mongo] existing mongod detected on 27017, reusing.');
+    return;
+  }
+  const mongod = getMongodExe();
+  if (!mongod) {
+    throw new Error(
+      'MongoDB binary bulunamadi. Kurulum paketinin icindeki mongod.exe eksik. ' +
+      'Lutfen kurulumu yeniden yapin veya destek ile iletisime gecin.'
+    );
+  }
+
+  const dbpath = mongoDbPath();
+  const out = fs.openSync(path.join(logDir(), 'mongod.out.log'), 'a');
+  const err = fs.openSync(path.join(logDir(), 'mongod.err.log'), 'a');
+
+  console.log(`[mongo] spawning portable: ${mongod} --dbpath ${dbpath}`);
+  updateSplash('MongoDB baslatiliyor...');
+
+  try {
+    mongodProcess = spawn(mongod, [
+      '--dbpath', dbpath,
+      '--port', String(MONGO_PORT),
+      '--bind_ip', MONGO_HOST,
+    ], { stdio: ['ignore', out, err], windowsHide: true });
+  } finally {
+    closeFdQuietly(out);
+    closeFdQuietly(err);
+  }
+
+  let earlyExitError = null;
+  mongodProcess.on('exit', (code, sig) => {
+    console.log(`[mongo] exited code=${code} sig=${sig}`);
+    if (code !== 0 && code !== null) {
+      earlyExitError = `mongod exit code ${code}. Olasi nedenler:\n` +
+        `  - Visual C++ Redistributable eksik (kurulum sirasinda otomatik yuklenir)\n` +
+        `  - CPU AVX desteklemiyor (MongoDB 4.4 kullaniliyor, olmamasi lazim)\n` +
+        `  - ${dbpath} klasorune yazma izni yok\n` +
+        `Detay: ${path.join(logDir(), 'mongod.err.log')}`;
+    }
+    mongodProcess = null;
+  });
+  mongodProcess.on('error', (e) => {
+    console.error('[mongo] spawn error:', e.message);
+    earlyExitError = `mongod baslatilamadi: ${e.message}`;
+  });
+
+  // wait up to 20s for mongod to listen
+  const deadline = Date.now() + 20000;
+  while (Date.now() < deadline) {
+    if (earlyExitError) throw new Error(earlyExitError);
+    if (await isMongoReachable()) {
+      console.log('[mongo] up and accepting connections');
+      return;
+    }
+    await new Promise(r => setTimeout(r, 400));
+  }
+  throw new Error(
+    'MongoDB 20 saniye icinde baslamadi.\n\n' +
+    `Log dosyasi: ${path.join(logDir(), 'mongod.err.log')}\n` +
+    'Cogu zaman Visual C++ Redistributable yuklu degilse bu hata olur.\n' +
+    'Kurulum paketi VC++ yukler ama antivirus engellemis olabilir.'
+  );
+}
+
+// ---------- Backend spawn (PyInstaller in prod, venv in dev) ----------
+function getBackendCommand() {
+  const base = getResourcesBase();
+
+  // Packaged: resources/backend/lgss-backend.exe  (PyInstaller frozen)
+  const frozenExe = path.join(base, 'backend', 'lgss-backend.exe');
+  if (fs.existsSync(frozenExe)) return { cmd: frozenExe, args: [], cwd: path.dirname(frozenExe) };
+
+  // Dev: use venv python -m uvicorn
+  const backendDir = path.join(base, 'backend');
+  const winVenv = path.join(backendDir, '.venv', 'Scripts', 'python.exe');
+  const python = fs.existsSync(winVenv) ? winVenv
+    : (process.env.LGSS_PYTHON || (process.platform === 'win32' ? 'python.exe' : 'python3'));
+
+  return {
+    cmd: python,
+    args: ['-m', 'uvicorn', 'server:app', '--host', BACKEND_HOST, '--port', String(BACKEND_PORT)],
+    cwd: backendDir,
+  };
+}
+
+function waitForBackend(timeoutMs = 120000) {
+  // 120s is a generous window. First cold-start on Windows can take 40-90s
+  // because PyInstaller unpacks the frozen bundle into a temp dir and
+  // antivirus often scans every file on the way. A shorter timeout trips
+  // false positives right after an update.
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve, reject) => {
+    let finished = false;
+    let retryTimer = null;
+    const finish = (fn, value) => {
+      if (finished) return;
+      finished = true;
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+      fn(value);
+    };
+    const tick = () => {
+      if (finished) return;
+      // If the backend process has already died, no point waiting: read the
+      // last lines of backend.err.log and surface them in the error dialog
+      // so the admin knows exactly WHY (missing module, bind error, etc.).
+      if (backendExitInfo) {
+        const errLog = path.join(logDir(), 'backend.err.log');
+        let tail = '';
+        try {
+          const buf = fs.readFileSync(errLog, 'utf8');
+          tail = buf.split(/\r?\n/).filter(Boolean).slice(-15).join('\n');
+        } catch {}
+        return finish(reject, new Error(
+          `Backend erken kapandı (exit code=${backendExitInfo.code}).\n\n` +
+          `Son hata satırları:\n${tail || '(log boş)'}\n\nTam log: ${errLog}`
+        ));
+      }
+      let requestDone = false;
+      const failOnce = () => {
+        if (requestDone) return;
+        requestDone = true;
+        retry();
+      };
+      const req = http.get(`${BACKEND_URL}/api/`, (res) => {
+        if (requestDone) return;
+        requestDone = true;
+        res.resume();
+        if (res.statusCode && res.statusCode < 500) return finish(resolve, true);
+        retry();
+      });
+      req.on('error', failOnce);
+      req.setTimeout(1500, () => {
+        try { req.destroy(); } catch (_) {}
+        failOnce();
+      });
+    };
+    const retry = () => {
+      if (finished) return;
+      if (Date.now() > deadline) return finish(reject, new Error(
+        `Backend hazır olmadı (${Math.round(timeoutMs/1000)}s timeout).\n\n` +
+        `Log klasörü: ${logDir()}`
+      ));
+      if (!retryTimer) {
+        retryTimer = setTimeout(() => {
+          retryTimer = null;
+          tick();
+        }, 700);
+      }
+    };
+    tick();
+  });
+}
+
+let backendExitInfo = null;  // { code, sig } if backend dies early
+
+
+function spawnBackend() {
+  if (backendProcess) return;
+  backendExitInfo = null;
+  const { cmd, args, cwd } = getBackendCommand();
+  if (!fs.existsSync(cwd)) throw new Error(`Backend klasörü bulunamadı: ${cwd}`);
+
+  const out = fs.openSync(path.join(logDir(), 'backend.out.log'), 'a');
+  const err = fs.openSync(path.join(logDir(), 'backend.err.log'), 'a');
+
+  console.log(`[backend] spawning: ${cmd} ${args.join(' ')} (cwd=${cwd})`);
+
+  try {
+    backendProcess = spawn(cmd, args, {
+      cwd,
+      stdio: ['ignore', out, err],
+      env: {
+        ...process.env,
+        PYTHONUNBUFFERED: '1',
+        MONGO_URL: process.env.MONGO_URL || `mongodb://${MONGO_HOST}:${MONGO_PORT}`,
+        DB_NAME: process.env.DB_NAME || 'lgss_manager',
+        CORS_ORIGINS: process.env.CORS_ORIGINS || '*',
+        // Point the backend at the Manager-side Globalization folder so the
+        // /api/i18n/custom endpoint resolves to <install_dir>/Globalization
+        // (NOT <manager_path>/Globalization which is the server workspace).
+        LGSS_GLOBALIZATION_DIR: getGlobalizationDir(),
+        PORT: String(BACKEND_PORT),
+        HOST: BACKEND_HOST,
+      },
+      windowsHide: true,
+      detached: false,
+    });
+  } finally {
+    closeFdQuietly(out);
+    closeFdQuietly(err);
+  }
+
+  backendProcess.on('exit', (code, sig) => {
+    console.log(`[backend] exited code=${code} sig=${sig}`);
+    backendExitInfo = { code, sig };   // poll-able flag used by waitForBackend
+    backendProcess = null;
+  });
+  backendProcess.on('error', (e) => console.error('[backend] error:', e.message));
+}
+
+function killChild(proc, name) {
+  if (!proc) return;
+  try {
+    if (process.platform === 'win32') {
+      execFile('taskkill', ['/pid', String(proc.pid), '/f', '/t']);
+    } else {
+      proc.kill('SIGTERM');
+    }
+  } catch (e) { console.warn(`[${name}] kill failed:`, e.message); }
+}
+
+function killByImage(name) {
+  // Belt-and-suspenders: kill any orphaned image of this name. Windows only.
+  if (process.platform !== 'win32') return;
+  try {
+    execFile('taskkill', ['/f', '/t', '/im', name], () => {});
+  } catch (_) {}
+}
+
+function shutdownChildren() {
+  killChild(backendProcess, 'backend'); backendProcess = null;
+  killChild(mongodProcess, 'mongo');    mongodProcess = null;
+  // Also sweep by image name in case a previous run left an orphan running
+  killByImage('lgss-backend.exe');
+  killByImage('steamcmd.exe');
+  killByImage('steamservice.exe');
+}
+
+// ---------- Splash (live status updates) ----------
+function showSplash(status = 'Arka plan servisleri baslatiliyor...') {
+  splashWindow = new BrowserWindow({
+    width: 560, height: 340, frame: false, resizable: false, alwaysOnTop: true,
+    backgroundColor: '#141512',
+    webPreferences: { nodeIntegration: false, contextIsolation: true },
+  });
+  const html = `
+  <html><head><style>
+    body{margin:0;font-family:Segoe UI,system-ui,sans-serif;background:#141512;color:#e7e2d6;
+         display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;padding:0 24px;text-align:center}
+    .logo{font-size:28px;font-weight:700;letter-spacing:2px;color:#c9a14a}
+    .tag{margin-top:4px;color:#8e8878;font-size:11px;letter-spacing:3px}
+    #status{margin-top:30px;color:#e7e2d6;font-size:13px;min-height:18px}
+    #hint{margin-top:6px;color:#8e8878;font-size:11px;min-height:14px}
+    .bar{margin-top:22px;width:380px;height:4px;background:#2a2721;border-radius:2px;overflow:hidden}
+    .bar span{display:block;height:100%;width:40%;background:#c9a14a;animation:slide 1.3s infinite}
+    @keyframes slide{0%{margin-left:-40%}100%{margin-left:100%}}
+  </style></head><body>
+    <div class="logo">LGSS MANAGER</div>
+    <div class="tag">SCUM SERVER MANAGER v${app.getVersion()}</div>
+    <div id="status">${status}</div>
+    <div id="hint"></div>
+    <div class="bar"><span></span></div>
+    <script>
+      window.addEventListener('message', (e) => {
+        if (e.data && e.data.type === 'status') {
+          document.getElementById('status').textContent = e.data.text || '';
+          document.getElementById('hint').textContent = e.data.hint || '';
+        }
+      });
+    </script>
+  </body></html>`;
+  splashWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
+}
+
+function updateSplash(text, hint = '') {
+  if (!splashWindow || splashWindow.isDestroyed()) return;
+  try {
+    splashWindow.webContents.executeJavaScript(
+      `postMessage({type:'status', text:${JSON.stringify(text)}, hint:${JSON.stringify(hint)}}, '*')`
+    );
+  } catch (_) {}
+}
+
+function closeSplash() {
+  if (splashWindow && !splashWindow.isDestroyed()) splashWindow.close();
+  splashWindow = null;
+}
+
+// ---------- Main window ----------
+function createWindow() {
+  mainWindow = new BrowserWindow({
+    width: 1600, height: 960, minWidth: 1100, minHeight: 680,
+    backgroundColor: '#141512', show: false,
+    title: 'LGSS Manager',
+    icon: path.join(__dirname, 'installer', 'icon.ico'),
+    autoHideMenuBar: true,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+  mainWindow.setMenuBarVisibility(false);
+
+  // ---- External link handler ---------------------------------------------
+  // Any `window.open(url, '_blank')` from React (Discord invite, feedback
+  // portal, GitHub releases, etc.) should open in the user's DEFAULT system
+  // browser — Chrome / Edge / Opera / whatever they have set, not a new
+  // Electron BrowserWindow rendering the site inside our shell. The default
+  // Electron behavior is to spawn an in-app window which strips cookies/auth
+  // and confuses users (see admin's screenshot — Discord invite rendered
+  // inside Electron instead of launching the Discord desktop client / browser).
+  // setWindowOpenHandler({ action: 'deny' }) cancels the new BrowserWindow,
+  // and shell.openExternal hands the URL to the OS to open with the
+  // registered http/https protocol handler.
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//i.test(url)) {
+      shell.openExternal(url).catch((err) => {
+        console.warn('[external-link] shell.openExternal failed:', err.message);
+      });
+    }
+    return { action: 'deny' };
+  });
+  // Also catch direct top-level navigations (e.g. <a href="..." target="_self">)
+  // — same logic: hand off http/https to the OS, keep file:// internal.
+  mainWindow.webContents.on('will-navigate', (e, navUrl) => {
+    if (/^https?:\/\//i.test(navUrl) && navUrl !== mainWindow.webContents.getURL()) {
+      e.preventDefault();
+      shell.openExternal(navUrl).catch(() => {});
+    }
+  });
+
+  const startUrl = process.env.ELECTRON_START_URL
+    || `file://${path.join(getResourcesBase(), 'frontend', 'build', 'index.html')}`;
+
+  // Retry load until the dev server (or file) is reachable
+  let loadAttempts = 0;
+  let loadRetryTimer = null;
+  const clearLoadRetry = () => {
+    if (loadRetryTimer) {
+      clearTimeout(loadRetryTimer);
+      loadRetryTimer = null;
+    }
+  };
+  const scheduleLoadRetry = () => {
+    if (loadAttempts >= 30 || loadRetryTimer) return;
+    loadRetryTimer = setTimeout(() => {
+      loadRetryTimer = null;
+      tryLoad();
+    }, 1500);
+  };
+  const tryLoad = () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    loadAttempts += 1;
+    mainWindow.loadURL(startUrl).catch((err) => {
+      console.warn(`[window] loadURL failed (attempt ${loadAttempts}): ${err.message}`);
+      scheduleLoadRetry();
+    });
+  };
+  tryLoad();
+
+  mainWindow.webContents.on('did-fail-load', (_e, code, desc, url) => {
+    console.warn(`[window] did-fail-load ${code} ${desc} ${url}`);
+    scheduleLoadRetry();
+  });
+
+  mainWindow.webContents.on('did-finish-load', () => {
+    clearLoadRetry();
+    console.log('[window] did-finish-load');
+    closeSplash();
+    mainWindow.show();
+  });
+
+  mainWindow.on('closed', () => {
+    clearLoadRetry();
+    mainWindow = null;
+  });
+
+  mainWindow.once('ready-to-show', () => { closeSplash(); mainWindow.show(); });
+  if (process.env.ELECTRON_START_URL) mainWindow.webContents.openDevTools({ mode: 'detach' });
+}
+
+// ---------- Lifecycle ----------
+app.whenReady().then(async () => {
+  await requireAdminOrExit();
+  showSplash('Yonetici ayricaliklari dogrulandi...');
+
+  // ---- DEV MODE FAST PATH ----
+  // When launched via `npm run dev` (which sets ELECTRON_START_URL), the
+  // developer is running uvicorn + MongoDB themselves in separate terminals.
+  // We MUST NOT spawn our own portable MongoDB / packaged backend EXE here —
+  // those binaries aren't even present in a dev checkout and the spawn fails
+  // with "MongoDB binary bulunamadi". We just wait for whatever backend the
+  // dev started on BACKEND_PORT, then load the React dev server.
+  const isDev = !!process.env.ELECTRON_START_URL;
+  if (isDev) {
+    try {
+      updateSplash('Dev backend bekleniyor...', `${BACKEND_URL}/api/`);
+      await waitForBackend(60000);
+      updateSplash('Arayuz yukleniyor...');
+    } catch (err) {
+      closeSplash();
+      dialog.showErrorBox(
+        'Dev backend bulunamadi',
+        `${err.message}\n\n` +
+        `Dev modu calistiriliyor (ELECTRON_START_URL=${process.env.ELECTRON_START_URL}). ` +
+        `Backend'i ayri bir PowerShell penceresinde manuel calistirin:\n\n` +
+        `  cd backend\n` +
+        `  .\\.venv\\Scripts\\Activate.ps1\n` +
+        `  uvicorn server:app --reload --port ${BACKEND_PORT}`
+      );
+      app.exit(1);
+      return;
+    }
+    createWindow();
+    return;
+  }
+
+  // ---- PRODUCTION PATH ----
+  try {
+    updateSplash('MongoDB kontrol ediliyor...');
+    await spawnMongodIfNeeded();
+    updateSplash('Backend baslatiliyor...', 'Python gomulu, ek kurulum gerekmez');
+    spawnBackend();
+    updateSplash('Backend hazir olmayi bekliyor...', 'Bu 10-30 saniye surebilir');
+    await waitForBackend();
+    updateSplash('Arayuz yukleniyor...');
+  } catch (err) {
+    closeSplash();
+    // Use showErrorBox (synchronous, no parent required) — showMessageBox
+    // without a parent window silently no-ops on some Windows Server 2019
+    // hosts, which caused the app to exit without the user ever seeing a
+    // message. showErrorBox always renders, even before BrowserWindows exist.
+    dialog.showErrorBox(
+      'Baslatma hatasi',
+      `${err.message}\n\nLog klasoru: ${logDir()}\n\n` +
+      `(Bu klasoru Windows Explorer adres cubuguna yapistirin.)`
+    );
+    shutdownChildren();
+    app.exit(1);
+    return;
+  }
+
+  createWindow();
+
+  // Enable DevTools & reload shortcuts (normally gone because we hide the menu)
+  globalShortcut.register('F12', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.toggleDevTools();
+    }
+  });
+  globalShortcut.register('CommandOrControl+Shift+I', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.toggleDevTools();
+    }
+  });
+  globalShortcut.register('CommandOrControl+R', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.reload();
+    }
+  });
+});
+
+app.on('will-quit', () => {
+  try { globalShortcut.unregisterAll(); } catch (_) {}
+  if (updatePollTimer) {
+    clearInterval(updatePollTimer);
+    updatePollTimer = null;
+  }
+  if (updatePollInitialTimer) {
+    clearTimeout(updatePollInitialTimer);
+    updatePollInitialTimer = null;
+  }
+});
+
+app.on('before-quit', shutdownChildren);
+app.on('window-all-closed', () => { shutdownChildren(); if (process.platform !== 'darwin') app.quit(); });
+app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
+
+// ---------- IPC: real OS operations ----------
+ipcMain.handle('lgss:list-disks', async () => {
+  if (os.platform() !== 'win32') return [];
+  return new Promise((resolve, reject) => {
+    execFile('wmic', ['logicaldisk', 'get', 'caption,freespace,size,filesystem,drivetype'], (err, stdout) => {
+      if (err) return reject(err);
+      const lines = stdout.trim().split(/\r?\n/).slice(1).filter(Boolean);
+      const disks = lines.map((line) => {
+        const parts = line.trim().split(/\s+/);
+        const [caption, drivetype, filesystem, freespace, size] = parts;
+        const total = parseInt(size || '0', 10);
+        const free = parseInt(freespace || '0', 10);
+        if (!total) return null;
+        return {
+          device: caption,
+          mountpoint: caption + '\\',
+          fstype: filesystem || 'NTFS',
+          total_gb: +(total / 1024 ** 3).toFixed(2),
+          used_gb: +((total - free) / 1024 ** 3).toFixed(2),
+          free_gb: +(free / 1024 ** 3).toFixed(2),
+          percent_used: +(((total - free) / total) * 100).toFixed(1),
+          eligible: free / 1024 ** 3 >= 30,
+          label: caption,
+        };
+      }).filter(Boolean);
+      resolve(disks);
+    });
+  });
+});
+
+ipcMain.handle('lgss:create-folder', async (_evt, folderPath) => {
+  fs.mkdirSync(folderPath, { recursive: true });
+  return { ok: true, path: folderPath };
+});
+
+ipcMain.handle('lgss:open-folder', async (_evt, folderPath) => {
+  await shell.openPath(folderPath);
+  return { ok: true };
+});
+
+ipcMain.handle('lgss:install-server', async (_evt, { folderPath, appId = '3792580' }) => {
+  const steamcmd = process.env.STEAMCMD_PATH || 'steamcmd.exe';
+  fs.mkdirSync(folderPath, { recursive: true });
+  return new Promise((resolve, reject) => {
+    const args = [
+      '+force_install_dir', `"${folderPath}"`,
+      '+login', 'anonymous',
+      '+app_update', String(appId), 'validate',
+      '+quit',
+    ];
+    const child = spawn(steamcmd, args, { shell: true });
+    let buf = '';
+    child.stdout.on('data', (d) => { buf += d.toString(); });
+    child.stderr.on('data', (d) => { buf += d.toString(); });
+    child.on('close', (code) => {
+      if (code === 0) resolve({ ok: true, log: buf });
+      else reject(new Error(`SteamCMD exited with code ${code}: ${buf.slice(-500)}`));
+    });
+  });
+});
+
+ipcMain.handle('lgss:write-config-files', async (_evt, plan) => {
+  const { config_dir, files } = plan;
+  fs.mkdirSync(config_dir, { recursive: true });
+  for (const f of files) fs.writeFileSync(f.path, f.content, 'utf-8');
+  return { ok: true, written: files.length };
+});
+
+ipcMain.handle('lgss:start-server', async (_evt, { serverFolder, port, queryPort, maxPlayers }) => {
+  const exe = path.join(serverFolder, 'SCUM', 'Binaries', 'Win64', 'SCUMServer.exe');
+  if (!fs.existsSync(exe)) return { ok: false, error: `SCUMServer.exe not found at ${exe}` };
+  const child = spawn(exe, [
+    `-log`,
+    `-port=${port || 7042}`,
+    `-QueryPort=${queryPort || 7043}`,
+    `-MaxPlayers=${maxPlayers || 64}`,
+  ], { detached: true, stdio: 'ignore', cwd: path.dirname(exe) });
+  child.unref();
+  return { ok: true, pid: child.pid };
+});
+
+ipcMain.handle('lgss:stop-server', async (_evt, { pid }) => {
+  try { process.kill(pid); return { ok: true }; } catch (e) { return { ok: false, error: e.message }; }
+});
+
+ipcMain.handle('lgss:backend-info', async () => ({
+  running: !!backendProcess,
+  url: BACKEND_URL,
+  logsDir: logDir(),
+  mongoRunning: !!mongodProcess || (await isMongoReachable()),
+}));
+
+// ---------- Auto-updater (GitHub releases) ----------
+// Frontend calls window.lgss.checkForUpdates() from the "Manager Update" button.
+// electron-updater is loaded lazily (see top of file) so missing node_modules
+// does not crash the app.
+function setupAutoUpdaterEvents() {
+  const u = getAutoUpdater();
+  if (!u) return;
+  u.on('update-available', (info) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('lgss:update-event', { type: 'available', info });
+    }
+  });
+  u.on('update-not-available', (info) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('lgss:update-event', { type: 'not-available', info });
+    }
+  });
+  u.on('download-progress', (p) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('lgss:update-event', { type: 'progress', progress: p });
+    }
+  });
+  u.on('update-downloaded', (info) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('lgss:update-event', { type: 'downloaded', info });
+    }
+  });
+  u.on('error', (err) => {
+    const msg = String(err?.message || err);
+    // Swallow the noise auto-updater produces when a release isn't published
+    // yet, or has been deleted / withdrawn from GitHub. Real errors still
+    // bubble up.
+    if (/latest\.yml|latest\.yaml|status 404|\s404\s|HTTP response not OK|ENOTFOUND|ECONNREFUSED|net::|Cannot parse releases feed|Unable to find latest version|releases\/latest|Cannot download|HttpError.*404|HttpError.*406/i.test(msg)) return;
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('lgss:update-event', { type: 'error', message: msg });
+    }
+  });
+}
+setupAutoUpdaterEvents();
+
+ipcMain.handle('lgss:check-for-updates', async () => {
+  const u = getAutoUpdater();
+  if (!u) return { ok: false, error: 'electron-updater not installed', currentVersion: app.getVersion() };
+  try {
+    const result = await u.checkForUpdates();
+    return {
+      ok: true,
+      currentVersion: app.getVersion(),
+      latestVersion: result?.updateInfo?.version,
+      updateAvailable: !!result?.updateInfo && result.updateInfo.version !== app.getVersion(),
+    };
+  } catch (e) {
+    // Common "noisy" failure modes we suppress and treat as "no update yet":
+    //   - latest.yml 404 (new release draft not yet published)
+    //   - ENOTFOUND / offline
+    //   - HTTP response not OK
+    // These are not real errors the user needs to see — just tell the UI
+    // there's no update available right now.
+    const msg = String(e?.message || e);
+    const silent = /latest\.yml|latest\.yaml|status 404|\s404\s|HTTP response not OK|ENOTFOUND|getaddrinfo|ECONNREFUSED|ECONNRESET|net::|Cannot parse releases feed|Unable to find latest version|releases\/latest|Cannot download|HttpError.*404|HttpError.*406/i.test(msg);
+    if (silent) {
+      return {
+        ok: true,
+        currentVersion: app.getVersion(),
+        latestVersion: app.getVersion(),
+        updateAvailable: false,
+        quiet: true,
+      };
+    }
+    return { ok: false, error: msg, currentVersion: app.getVersion() };
+  }
+});
+
+// Silent background polling — every 5 minutes the main process quietly asks
+// the updater. If a newer version is detected we push a one-shot event so
+// the top-bar button can flash. No modal, no toast: just the indicator.
+let updatePollTimer = null;
+let updatePollInitialTimer = null;
+function startUpdatePolling() {
+  if (updatePollTimer) return;
+  const doCheck = async () => {
+    const u = getAutoUpdater();
+    if (!u) return;
+    try {
+      const r = await u.checkForUpdates();
+      const latest = r?.updateInfo?.version;
+      const available = !!latest && latest !== app.getVersion();
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('lgss:update-poll', {
+          currentVersion: app.getVersion(),
+          latestVersion: latest || app.getVersion(),
+          updateAvailable: available,
+        });
+      }
+    } catch { /* silent by design */ }
+  };
+  updatePollTimer = setInterval(doCheck, 5 * 60 * 1000);
+  // First check after 30s (give backend time to settle).
+  updatePollInitialTimer = setTimeout(() => {
+    updatePollInitialTimer = null;
+    doCheck();
+  }, 30 * 1000);
+}
+startUpdatePolling();
+
+ipcMain.handle('lgss:download-update', async () => {
+  const u = getAutoUpdater();
+  if (!u) return { ok: false, error: 'electron-updater not installed' };
+  try { await u.downloadUpdate(); return { ok: true }; }
+  catch (e) {
+    // Same quiet handling as the check: if the asset is gone (release
+    // withdrawn) just pretend there's nothing to update.
+    const msg = String(e?.message || e);
+    if (/status 404|\s404\s|Cannot download|Unable to find|HTTP response not OK|ENOTFOUND|ECONNREFUSED|net::/i.test(msg)) {
+      return { ok: false, quiet: true, error: 'No release available' };
+    }
+    return { ok: false, error: msg };
+  }
+});
+
+ipcMain.handle('lgss:install-update', async () => {
+  const u = getAutoUpdater();
+  if (!u) return { ok: false, error: 'electron-updater not installed' };
+  u.quitAndInstall(false, true);
+  return { ok: true };
+});
+
+ipcMain.handle('lgss:get-version', async () => app.getVersion());

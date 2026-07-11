@@ -1,0 +1,4013 @@
+from fastapi import FastAPI, APIRouter, HTTPException, UploadFile, File, Form, Depends
+from dotenv import load_dotenv
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+import os
+import re
+import logging
+import platform
+import subprocess
+import psutil
+from pathlib import Path
+from pydantic import BaseModel, Field, ConfigDict
+from typing import List, Dict, Any, Optional
+import uuid
+from datetime import datetime, timezone, timedelta
+from scum_parser import (
+    load_defaults,
+    parse_real_config_dir,
+    render_server_settings_ini,
+    render_gameusersettings_ini,
+    render_input_ini,
+    render_raid_times_json,
+    render_notifications_json,
+    render_economy_json,
+    render_user_list,
+    parse_user_list_text,
+    parse_ini_sections,
+    parse_input_ini,
+)
+import scum_db
+import scum_backup
+import scum_process as scum_proc
+import scum_discord
+import json as json_lib
+import io
+import asyncio
+import secrets
+
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+mongo_url = os.environ['MONGO_URL']
+# v1.0.37k — DB handle moved to app_state.py so route modules under
+# `routes/` can share it without circular imports. We import the SAME
+# client/db here so existing helpers (scheduler, lifecycle, etc.) keep
+# working without renames.
+from app_state import client, db, logger as _state_logger  # noqa: E402
+
+app = FastAPI(title="LGSS SCUM Server Manager")
+api_router = APIRouter(prefix="/api")
+
+import jwt
+import uvicorn
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+# --- REMOTE API APP & SECURITY ---
+remote_app = FastAPI(
+    title="LGSS Remote API",
+    description="Secure REST API for remote SCUM server management.",
+    version="1.1.4"
+)
+
+remote_app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+from fastapi.responses import HTMLResponse
+from remote_html import DASHBOARD_HTML
+
+@remote_app.get("/", response_class=HTMLResponse, include_in_schema=False)
+async def remote_root_dashboard():
+    return DASHBOARD_HTML
+
+JWT_SECRET = os.environ.get("LGSS_JWT_SECRET") or os.environ.get("JWT_SECRET") or secrets.token_urlsafe(48)
+JWT_ALGORITHM = "HS256"
+
+security = HTTPBearer()
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        username = payload.get("sub")
+        if username is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        
+        setup = await db.setup.find_one({"_id": SETUP_DOC_ID})
+        if not setup or not setup.get("api_enabled"):
+            raise HTTPException(status_code=401, detail="API is disabled")
+        if username != setup.get("api_username", "admin"):
+            raise HTTPException(status_code=401, detail="User not found")
+        return username
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+class AuthPayload(BaseModel):
+    username: str
+    password: str
+
+@remote_app.post("/api/auth", tags=["Authentication"])
+async def remote_auth(payload: AuthPayload):
+    setup = await db.setup.find_one({"_id": SETUP_DOC_ID})
+    if not setup or not setup.get("api_enabled"):
+        raise HTTPException(status_code=400, detail="Remote API is disabled")
+    
+    username = (setup.get("api_username") or "").strip()
+    password = setup.get("api_password") or ""
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="Remote API credentials are not configured")
+    
+    if payload.username != username or payload.password != password:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    
+    token = jwt.encode(
+        {"sub": username, "exp": datetime.now(timezone.utc) + timedelta(days=7)},
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM
+    )
+    return {"token": token}
+
+@remote_app.get("/api/servers", tags=["Servers"], dependencies=[Depends(get_current_user)])
+async def remote_list_servers():
+    docs = await db.servers.find({}, {"_id": 0}).to_list(500)
+    servers_list = []
+    for s in docs:
+        servers_list.append({
+            "id": s.get("id"),
+            "name": s.get("name"),
+            "folder_name": s.get("folder_name"),
+            "status": s.get("status"),
+            "game_port": s.get("game_port"),
+            "query_port": s.get("query_port"),
+            "installed": s.get("installed"),
+            "update_available": s.get("update_available"),
+            "installed_build_id": s.get("installed_build_id")
+        })
+    return servers_list
+
+@remote_app.post("/api/servers/{server_id}/start", tags=["Servers"], dependencies=[Depends(get_current_user)])
+async def remote_start_server(server_id: str):
+    try:
+        res = await start_server(server_id)
+        return res
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@remote_app.post("/api/servers/{server_id}/stop", tags=["Servers"], dependencies=[Depends(get_current_user)])
+async def remote_stop_server(server_id: str, force: bool = False):
+    try:
+        res = await stop_server(server_id, force=force)
+        return res
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@remote_app.post("/api/servers/{server_id}/restart", tags=["Servers"], dependencies=[Depends(get_current_user)])
+async def remote_restart_server(server_id: str):
+    try:
+        res = await restart_server(server_id)
+        return res
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@remote_app.get("/api/servers/{server_id}/players", tags=["Servers"], dependencies=[Depends(get_current_user)])
+async def remote_list_players(server_id: str):
+    try:
+        from routes.players import list_players
+        res = await list_players(server_id)
+        return res
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@remote_app.get("/api/servers/{server_id}/logs", tags=["Servers"], dependencies=[Depends(get_current_user)])
+async def remote_list_logs(server_id: str, type: Optional[str] = None, player: Optional[str] = None, limit: int = 100):
+    try:
+        res = await list_server_events(server_id, type=type, player=player, limit=limit)
+        return res
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Redundant remote API routes (backups, ban/unban, settings modifications) removed for simplification.
+
+# --- SERVER LIFECYCLE MANAGEMENT ---
+_remote_api_task: Optional[asyncio.Task] = None
+_remote_api_server: Optional[uvicorn.Server] = None
+
+async def start_remote_api_server(port: int):
+    global _remote_api_task, _remote_api_server
+    if _remote_api_task and not _remote_api_task.done():
+        logger.info("Remote API server task already running.")
+        return
+
+    # Add Windows Defender Firewall inbound rule for this port dynamically
+    if platform.system() == "Windows":
+        try:
+            rule_name = f"LGSS-Remote-API-{port}"
+            disp_name = f"LGSS Remote API (Port {port})"
+            # We use powershell to add/overwrite the firewall rule
+            cmd = f'powershell -Command "New-NetFirewallRule -Name \\"{rule_name}\\" -DisplayName \\"{disp_name}\\" -Direction Inbound -LocalPort {port} -Protocol TCP -Action Allow -Force -ErrorAction SilentlyContinue"'
+            subprocess.run(cmd, shell=True, capture_output=True)
+            logger.info("Ensured Windows Firewall rule for port %d is added.", port)
+        except Exception as e:
+            logger.warning("Failed to configure Windows Firewall for port %d: %s", port, e)
+
+    config = uvicorn.Config(remote_app, host="0.0.0.0", port=port, log_level="info", reload=False)
+    _remote_api_server = uvicorn.Server(config)
+    
+    async def serve_wrapper():
+        try:
+            logger.info("Starting Remote API server on port %d...", port)
+            await _remote_api_server.serve()
+        except asyncio.CancelledError:
+            logger.info("Remote API server task cancelled.")
+        except Exception as e:
+            logger.exception("Remote API server crashed: %s", e)
+
+    _remote_api_task = asyncio.create_task(serve_wrapper())
+
+async def stop_remote_api_server():
+    global _remote_api_task, _remote_api_server
+    if _remote_api_server:
+        logger.info("Stopping Remote API server...")
+        _remote_api_server.should_exit = True
+        await asyncio.sleep(0.5)
+    if _remote_api_task and not _remote_api_task.done():
+        _remote_api_task.cancel()
+        try:
+            await _remote_api_task
+        except asyncio.CancelledError:
+            pass
+    _remote_api_task = None
+    _remote_api_server = None
+
+# SCUM server requirement (approx)
+SCUM_SERVER_REQUIRED_GB = 30
+SETUP_DOC_ID = "lgss-setup"
+
+
+# ---------- MODELS ----------
+class DiskInfo(BaseModel):
+    device: str
+    mountpoint: str
+    fstype: str
+    total_gb: float
+    used_gb: float
+    free_gb: float
+    percent_used: float
+    eligible: bool
+    label: str
+
+
+class SetupState(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    completed: bool = False
+    selected_disk: Optional[str] = None
+    manager_path: Optional[str] = None
+    is_admin_confirmed: bool = False
+    language: str = "tr"
+    theme: str = "wasteland"
+    api_enabled: bool = False
+    api_port: int = 8002
+    api_username: str = "admin"
+    api_password: str = ""
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class SetupUpdate(BaseModel):
+    selected_disk: Optional[str] = None
+    manager_path: Optional[str] = None
+    is_admin_confirmed: Optional[bool] = None
+    completed: Optional[bool] = None
+    language: Optional[str] = None
+    theme: Optional[str] = None
+    api_enabled: Optional[bool] = None
+    api_port: Optional[int] = None
+    api_username: Optional[str] = None
+    api_password: Optional[str] = None
+
+
+class ServerProfile(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    folder_name: str
+    folder_path: str
+    status: str = "Stopped"
+    installed: bool = False
+    steam_app_id: str = "3792580"
+    public_ip: Optional[str] = None
+    game_port: int = 7777
+    query_port: int = 7778
+    max_players: int = 64
+    launch_args: str = ""  # admin-supplied SCUMServer.exe extra command-line args
+    installed_build_id: Optional[str] = None
+    update_available: bool = False
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    settings: Dict[str, Any] = Field(default_factory=dict)
+    automation: Dict[str, Any] = Field(default_factory=lambda: {
+        "enabled": False,
+        "restart_times": [],          # ["06:00", "12:00", "18:00", "00:00"]
+        # v1.0.37h — Day-of-week filter for restart_times. Each entry is a
+        # lowercase 3-letter weekday code: sun, mon, tue, wed, thu, fri, sat.
+        # Empty list OR all-7 entries = "every day" (legacy behaviour kept
+        # for back-compat with existing server profiles). Admins who only
+        # want weekday restarts uncheck Sat/Sun.
+        "restart_days": ["sun", "mon", "tue", "wed", "thu", "fri", "sat"],
+        "auto_update_enabled": False,
+        "update_check_interval_min": 360,  # 6 hours default per user preference
+        "backup_enabled": True,               # periodic SaveFiles snapshots
+        "backup_interval_min": 10,            # every 10 min by default
+        "backup_keep_count": 30,              # prune to newest N auto-backups
+        # Internal-only since v1.0.37h (UI no longer exposes it; default kept
+        # so the graceful-shutdown sequence still flushes SaveFiles).
+        "shutdown_timeout_sec": 30,
+        # v1.0.37g — Per-server IANA timezone for restart_times comparison.
+        # Empty string means UTC. Admins who run the Manager on a server in a
+        # DIFFERENT region (e.g. EU-based VPS hosting a TR-community server)
+        # set this to their COMMUNITY's timezone (e.g. "Europe/Istanbul").
+        "timezone": "",
+        "auto_restart_on_crash": True,
+        "keep_running": False,
+    })
+
+
+class AutomationUpdate(BaseModel):
+    enabled: Optional[bool] = None
+    restart_times: Optional[List[str]] = None
+    restart_days: Optional[List[str]] = None  # v1.0.37h — DoW filter
+    auto_update_enabled: Optional[bool] = None
+    update_check_interval_min: Optional[int] = None
+    backup_enabled: Optional[bool] = None
+    backup_interval_min: Optional[int] = None
+    backup_keep_count: Optional[int] = None
+    timezone: Optional[str] = None
+    auto_restart_on_crash: Optional[bool] = None
+    keep_running: Optional[bool] = None
+
+
+class ServerCreate(BaseModel):
+    name: Optional[str] = None
+
+
+class ServerPortsUpdate(BaseModel):
+    game_port: Optional[int] = None
+    query_port: Optional[int] = None
+    max_players: Optional[int] = None
+
+
+class ServerSettingsUpdate(BaseModel):
+    settings: Dict[str, Any]
+
+
+class ServerRename(BaseModel):
+    name: str
+
+
+class UserEntry(BaseModel):
+    steam_id: str
+    flags: List[str] = Field(default_factory=list)
+    note: Optional[str] = None
+
+
+class UserListUpdate(BaseModel):
+    list_name: str  # admins | banned | exclusive
+    users: List[UserEntry]
+
+
+# ---------- DEFAULT SCUM SETTINGS (categorized) ----------
+def default_scum_settings() -> Dict[str, Any]:
+    return load_defaults()
+
+
+# ---------- ENDPOINTS ----------
+@api_router.get("/")
+async def root():
+    return {"service": "LGSS SCUM Server Manager", "version": "1.1.4"}
+
+
+_PUBLIC_IP_CACHE = {"ts": 0, "ip": None}
+
+
+@api_router.get("/system/public-ip")
+async def get_public_ip():
+    """Return the host's public IPv4. Cached 5 minutes so we don't hammer
+    ipify. Players use this IP (plus the server's connect-port, which is
+    game_port + 2 per SCUM's UDP convention) to join from the in-game
+    server list or the 'Direct Connect' box."""
+    import httpx
+    import time
+    now = time.time()
+    if _PUBLIC_IP_CACHE["ip"] and now - _PUBLIC_IP_CACHE["ts"] < 300:
+        return {"ip": _PUBLIC_IP_CACHE["ip"], "cached": True}
+    ip = None
+    # Try a couple of free services; first one wins.
+    endpoints_to_try = ("https://api.ipify.org", "https://ifconfig.me/ip")
+    for url in endpoints_to_try:
+        try:
+            async with httpx.AsyncClient(timeout=4.0, follow_redirects=True) as c:
+                r = await c.get(url)
+                candidate = r.text.strip()
+                # Basic IPv4 sanity check
+                parts = candidate.split(".")
+                if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+                    ip = candidate
+                    break
+        except Exception:
+            continue
+    if ip:
+        _PUBLIC_IP_CACHE["ts"] = now
+        _PUBLIC_IP_CACHE["ip"] = ip
+    
+    # Auto-detect local network IP
+    import socket
+    local_ip = "127.0.0.1"
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        pass
+
+    return {"ip": _PUBLIC_IP_CACHE["ip"], "local_ip": local_ip, "cached": ip is None}
+
+
+@api_router.get("/system/admin-check")
+async def admin_check():
+    is_admin = False
+    try:
+        if platform.system() == "Windows":
+            import ctypes
+            is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+        else:
+            is_admin = os.geteuid() == 0
+    except Exception:
+        is_admin = False
+    return {
+        "is_admin": is_admin,
+        "platform": platform.system(),
+        "release": platform.release(),
+    }
+
+
+@api_router.get("/disks", response_model=List[DiskInfo])
+async def list_disks():
+    """List local disks with capacity. On Windows shows drive letters. On Linux/container shows mount points."""
+    disks: List[DiskInfo] = []
+    seen = set()
+    for part in psutil.disk_partitions(all=False):
+        if part.fstype in ("squashfs", "tmpfs", "devtmpfs", "overlay"):
+            continue
+        if part.mountpoint in seen:
+            continue
+        seen.add(part.mountpoint)
+        try:
+            usage = psutil.disk_usage(part.mountpoint)
+        except PermissionError:
+            continue
+        total_gb = round(usage.total / (1024**3), 2)
+        free_gb = round(usage.free / (1024**3), 2)
+        used_gb = round(usage.used / (1024**3), 2)
+        if total_gb < 1:
+            continue
+        label = part.device if platform.system() == "Windows" else part.mountpoint
+        disks.append(DiskInfo(
+            device=part.device,
+            mountpoint=part.mountpoint,
+            fstype=part.fstype or "unknown",
+            total_gb=total_gb,
+            used_gb=used_gb,
+            free_gb=free_gb,
+            percent_used=round(usage.percent, 1),
+            eligible=free_gb >= SCUM_SERVER_REQUIRED_GB,
+            label=label,
+        ))
+    # If no disks found (rare), synthesize a demo one
+    if not disks:
+        disks.append(DiskInfo(
+            device="C:\\",
+            mountpoint="C:\\",
+            fstype="NTFS",
+            total_gb=500.0,
+            used_gb=220.0,
+            free_gb=280.0,
+            percent_used=44.0,
+            eligible=True,
+            label="C:\\",
+        ))
+    return disks
+
+
+@api_router.get("/setup/requirements")
+async def setup_requirements():
+    return {
+        "required_gb_per_server": SCUM_SERVER_REQUIRED_GB,
+        "recommended_free_gb": SCUM_SERVER_REQUIRED_GB + 10,
+    }
+
+
+@api_router.get("/setup", response_model=SetupState)
+async def get_setup():
+    doc = await db.setup.find_one({"_id": SETUP_DOC_ID}, {"_id": 0})
+    if not doc:
+        state = SetupState()
+        await db.setup.insert_one({"_id": SETUP_DOC_ID, **state.model_dump()})
+        return state
+    return SetupState(**doc)
+
+
+@api_router.put("/setup", response_model=SetupState)
+async def update_setup(payload: SetupUpdate):
+    existing = await db.setup.find_one({"_id": SETUP_DOC_ID}, {"_id": 0}) or SetupState().model_dump()
+    data = {**existing}
+    for k, v in payload.model_dump(exclude_none=True).items():
+        data[k] = v
+    data["updated_at"] = datetime.now(timezone.utc).isoformat()
+    await db.setup.update_one({"_id": SETUP_DOC_ID}, {"$set": data}, upsert=True)
+
+    # ── Remote API server lifecycle control ──────────────────────────────
+    was_enabled = existing.get("api_enabled", False)
+    old_port = existing.get("api_port", 8002)
+    now_enabled = data.get("api_enabled", False)
+    now_port = data.get("api_port", 8002)
+    if now_enabled and not ((data.get("api_username") or "").strip() and data.get("api_password")):
+        raise HTTPException(status_code=400, detail="Remote API username and password are required")
+
+    if was_enabled and not now_enabled:
+        await stop_remote_api_server()
+    elif now_enabled:
+        if not was_enabled or old_port != now_port:
+            await stop_remote_api_server()
+            await start_remote_api_server(now_port)
+
+    return SetupState(**data)
+
+
+@api_router.post("/setup/reset", response_model=SetupState)
+async def reset_setup():
+    state = SetupState()
+    await db.setup.update_one({"_id": SETUP_DOC_ID}, {"$set": state.model_dump()}, upsert=True)
+    await db.servers.delete_many({})
+    return state
+
+
+@api_router.get("/servers", response_model=List[ServerProfile])
+async def list_servers():
+    docs = await db.servers.find({}, {"_id": 0}).to_list(500)
+    return [ServerProfile(**d) for d in docs]
+
+
+# ───────────────────────────────────────────────────────────────────────
+# Custom community translations (XAML drop-in folder)
+# ───────────────────────────────────────────────────────────────────────
+#
+# Workflow:
+#   1. Admin downloads en.xaml from the language modal.
+#   2. Edits it (translates each <sys:String>) and renames to e.g. pl.xaml.
+#   3. Drops the file into:
+#        <manager_path>/Globalization/<lang>.xaml
+#      e.g. C:/LGSSManagers/Globalization/pl.xaml
+#   4. Clicks "Reload" in the language modal → manager re-scans the folder
+#      and the new language appears in the picker WITHOUT a release.
+#
+# Once the admin is happy with the translation they send the .xaml file
+# back to LGSS for inclusion in the next release (built-in translations).
+
+_XAML_ENTRY_RE = re.compile(
+    r'<sys:String\s+x:Key="([^"]+)"\s*>(.*?)</sys:String>',
+    re.DOTALL,
+)
+
+
+def _xml_unescape(s: str) -> str:
+    """Inverse of the XAML exporter's escape helper. .NET's XmlReader only
+    decodes the same 5 entities so we mirror them here for symmetry."""
+    return (
+        s.replace("&apos;", "'")
+         .replace("&quot;", '"')
+         .replace("&gt;", ">")
+         .replace("&lt;", "<")
+         .replace("&amp;", "&")
+    )
+
+
+def _parse_xaml_file(path: Path) -> Dict[str, str]:
+    """Parse a single WPF GlobalizationResourceDictionary XAML file. We use a
+    forgiving regex instead of a full XML parser because:
+      * Manually edited files can contain a broken closing tag, but
+        we still want to recover the rest of the strings.
+      * The XAML uses .NET-only namespaces which Python's ElementTree handles
+        but with extra ceremony for no benefit here - we only care about
+        <sys:String x:Key="...">value</sys:String> rows.
+    """
+    out: Dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8-sig")  # tolerant of UTF-8 BOM
+    except Exception as e:
+        logger.info("XAML read failed for %s: %s", path, e)
+        return out
+    for m in _XAML_ENTRY_RE.finditer(text):
+        key, value = m.group(1), m.group(2)
+        out[key] = _xml_unescape(value.strip())
+    return out
+
+
+async def _get_globalization_dir() -> Optional[Path]:
+    """Locate the Manager's Globalization folder.
+
+    This folder lives **alongside the Manager installation**, NOT inside the
+    SCUM-server workspace (`<manager_path>/Servers/`). On Windows production
+    builds Electron sets `LGSS_GLOBALIZATION_DIR` to e.g.
+
+        C:\\Program Files\\LGSS\\LGSS Manager\\Globalization
+
+    Order of resolution:
+      1. `LGSS_GLOBALIZATION_DIR` env var (Electron sets this in production,
+         testers can override in `backend/.env`).
+      2. `<ROOT_DIR>/Globalization/`        — dev / preview fallback
+         (i.e. `/app/Globalization`).
+    """
+    override = os.environ.get("LGSS_GLOBALIZATION_DIR")
+    if override:
+        return Path(override)
+    return ROOT_DIR.parent / "Globalization"  # /app/Globalization in preview
+
+
+@api_router.get("/i18n/custom")
+async def get_custom_translations():
+    """Scan the manager's Globalization folder and return every parsed XAML
+    file as a JSON map: { "pl": { "brand": "...", "yes": "Tak", ... }, ... }.
+
+    Frontend merges this into its in-memory translations dict on startup so
+    new languages appear without rebuilding the app. Each entry also reports
+    metadata (Generic_TranslatedBy, Generic_TranslationDate) so the language
+    picker can show "Polish · Mehmet · 2026-03-14".
+    """
+    gdir = await _get_globalization_dir()
+    if not gdir or not gdir.is_dir():
+        return {"globalization_dir": str(gdir) if gdir else None, "languages": {}}
+    languages: Dict[str, Any] = {}
+    for xaml_file in sorted(gdir.glob("*.xaml")):
+        # Lang code = filename minus suffix. Accept en.xaml AND en-US.xaml
+        # (ARK SM convention) — keep just the leading ISO code.
+        stem = xaml_file.stem.split("-")[0].lower()
+        parsed = _parse_xaml_file(xaml_file)
+        if not parsed:
+            continue
+        meta = {
+            "translator": parsed.pop("Generic_TranslatedBy", "Community"),
+            "date": parsed.pop("Generic_TranslationDate", ""),
+            "filename": xaml_file.name,
+        }
+        parsed.pop("Generic_LanguageCode", None)
+        languages[stem] = {"meta": meta, "strings": parsed}
+    return {"globalization_dir": str(gdir), "languages": languages}
+
+
+@api_router.post("/servers", response_model=ServerProfile)
+async def create_server(payload: ServerCreate):
+    setup_doc = await db.setup.find_one({"_id": SETUP_DOC_ID}, {"_id": 0})
+    if not setup_doc or not setup_doc.get("manager_path"):
+        raise HTTPException(status_code=400, detail="Setup not completed. Select a disk first.")
+    existing_count = await db.servers.count_documents({})
+    idx = existing_count + 1
+    folder_name = f"Server{idx}"
+    name = payload.name or folder_name
+    manager_path = setup_doc["manager_path"]
+    sep = "\\" if ("\\" in manager_path or (len(manager_path) >= 2 and manager_path[1] == ":")) else "/"
+    # LGSSManagers/Servers/ServerN/ per user's new spec
+    folder_path = f"{manager_path}{sep}Servers{sep}{folder_name}"
+    profile = ServerProfile(
+        name=name,
+        folder_name=folder_name,
+        folder_path=folder_path,
+        settings=default_scum_settings(),
+    )
+    await db.servers.insert_one(profile.model_dump())
+    return profile
+
+
+@api_router.get("/servers/{server_id}", response_model=ServerProfile)
+async def get_server(server_id: str):
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Server not found")
+    return ServerProfile(**doc)
+
+
+@api_router.put("/servers/{server_id}", response_model=ServerProfile)
+async def rename_server(server_id: str, payload: ServerRename):
+    res = await db.servers.find_one_and_update(
+        {"id": server_id},
+        {"$set": {"name": payload.name}},
+        projection={"_id": 0},
+        return_document=True,
+    )
+    if not res:
+        raise HTTPException(status_code=404, detail="Server not found")
+    return ServerProfile(**res)
+
+
+@api_router.put("/servers/{server_id}/ports", response_model=ServerProfile)
+async def update_server_ports(server_id: str, payload: ServerPortsUpdate):
+    """Update game port / query port / max players. Takes effect on next START."""
+    update: Dict[str, Any] = {}
+    if payload.game_port is not None:
+        if not (1024 <= payload.game_port <= 65532):
+            raise HTTPException(status_code=400, detail="game_port must be 1024-65532 (SCUM uses 3 consecutive ports)")
+        update["game_port"] = payload.game_port
+        # If caller doesn't supply query_port, default to game_port + 1 (the
+        # SCUM standard: game/query/steam = port/port+1/port+2 ardışık triplet).
+        # v1.0.23 briefly used +3 thinking query had to be outside the range —
+        # that was incorrect; SCUM's "Steam port" (the actual connect port)
+        # is game_port+2, not the query. Reverted to +1 in v1.0.23.
+        if payload.query_port is None:
+            update["query_port"] = payload.game_port + 1
+    if payload.query_port is not None:
+        if not (1024 <= payload.query_port <= 65535):
+            raise HTTPException(status_code=400, detail="query_port must be 1024-65535")
+        update["query_port"] = payload.query_port
+    if payload.max_players is not None:
+        if not (1 <= payload.max_players <= 128):
+            raise HTTPException(status_code=400, detail="max_players must be 1-128")
+        update["max_players"] = payload.max_players
+    if not update:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    res = await db.servers.find_one_and_update(
+        {"id": server_id},
+        {"$set": update},
+        projection={"_id": 0},
+        return_document=True,
+    )
+    if not res:
+        raise HTTPException(status_code=404, detail="Server not found")
+    return ServerProfile(**res)
+
+
+# v1.0.37f: FIREWALL / NETWORK SETUP endpoints REMOVED per user request.
+#   - /firewall/status, /firewall/apply, /firewall/remove, /diagnostics/visibility
+# Admins manage Windows Firewall manually (one-time GUI click).
+
+
+# v1.0.37k — Connection diagnostics endpoint moved to routes/diagnostics.py.
+
+@api_router.post("/servers/{server_id}/open-folder")
+async def open_server_folder(server_id: str):
+    r"""Open the server's installation folder in the OS file explorer.
+
+    On Windows this is ``explorer.exe "<folder_path>"`` — that's what admins
+    actually want when troubleshooting (browse ``Saved\Logs``, edit ini, etc).
+    No-op on Linux preview since the manager UI is server-side only.
+    """
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0, "folder_path": 1})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Server not found")
+    folder = doc.get("folder_path")
+    if not folder:
+        raise HTTPException(status_code=400, detail="Server has no installation folder yet")
+    p = Path(folder)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail=f"Folder does not exist: {folder}")
+    try:
+        if platform.system() == "Windows":
+            # Use the absolute path to avoid `explorer.exe \tmp\...` quirks.
+            subprocess.Popen(["explorer.exe", str(p.resolve())], shell=False)
+        elif platform.system() == "Darwin":
+            subprocess.Popen(["open", str(p.resolve())])
+        else:
+            # Linux pod / preview — most managers won't be opening folders here.
+            subprocess.Popen(["xdg-open", str(p.resolve())])
+        return {"opened": True, "path": str(p.resolve())}
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=500, detail=f"OS file manager not available: {e}")
+
+
+class ServerLaunchArgsUpdate(BaseModel):
+    launch_args: str = ""
+
+
+@api_router.put("/servers/{server_id}/launch-args", response_model=ServerProfile)
+async def update_server_launch_args(server_id: str, payload: ServerLaunchArgsUpdate):
+    """Set the admin's custom SCUMServer.exe arguments (mod ids, custom flags).
+    Stored verbatim and shlex-split at start time; takes effect on next START."""
+    # Soft sanity cap so a runaway paste doesn't end up on the command line.
+    val = (payload.launch_args or "").strip()
+    if len(val) > 2000:
+        raise HTTPException(status_code=400, detail="launch_args too long (max 2000 chars)")
+    res = await db.servers.find_one_and_update(
+        {"id": server_id},
+        {"$set": {"launch_args": val}},
+        projection={"_id": 0},
+        return_document=True,
+    )
+    if not res:
+        raise HTTPException(status_code=404, detail="Server not found")
+    return ServerProfile(**res)
+
+
+@api_router.put("/servers/{server_id}/settings", response_model=ServerProfile)
+async def update_server_settings(server_id: str, payload: ServerSettingsUpdate):
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Server not found")
+    merged = {**doc.get("settings", {})}
+    for category, values in payload.settings.items():
+        if isinstance(values, dict):
+            merged[category] = {**merged.get(category, {}), **values}
+        else:
+            merged[category] = values
+    await db.servers.update_one({"id": server_id}, {"$set": {"settings": merged}})
+    doc["settings"] = merged
+    # Auto-persist to real .ini/.json files so manager edits are never lost.
+    # Only if the server has been installed AND the config directory already
+    # exists (i.e. first-boot already ran). Otherwise SCUM will overwrite
+    # anything we write here on its first boot.
+    if doc.get("installed"):
+        try:
+            _write_config_files_for_doc(doc)
+        except Exception:
+            logger.exception("update_server_settings: auto-write config failed")
+    return ServerProfile(**doc)
+
+
+@api_router.delete("/servers/{server_id}")
+async def delete_server(server_id: str):
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0, "folder_path": 1})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Server not found")
+    res = await db.servers.delete_one({"id": server_id})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Server not found")
+    # v1.0.37i — Clean up the firewall rules this server owned so deleted
+    # profiles don't leave stale `LGSS-SCUM-*` entries cluttering Defender.
+    try:
+        await scum_discord.stop_bot(server_id)
+    except Exception as e:
+        logger.info("Discord cleanup skipped for deleted server %s: %s", server_id, e)
+    try:
+        _clear_server_runtime_state(server_id, doc.get("folder_path"))
+    except Exception as e:
+        logger.info("Runtime cleanup skipped for deleted server %s: %s", server_id, e)
+    try:
+        scum_proc.remove_firewall_rules(server_id)
+    except Exception as e:
+        logger.info("Firewall cleanup skipped for %s: %s", server_id, e)
+    return {"ok": True}
+
+
+@api_router.post("/servers/{server_id}/start", response_model=ServerProfile)
+async def start_server(server_id: str):
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Server not found")
+    await _do_start_internal(server_id, doc)
+    fresh = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    return ServerProfile(**fresh)
+
+
+async def _do_pre_stop_backup(server_id: str, doc: Dict[str, Any], backup_type: str = "auto") -> None:
+    """Best-effort pre-stop SaveFiles snapshot.
+
+    Called before any planned stop/restart/update so the next start can fall
+    back to the most recent state if the shutdown corrupts a save. Never
+    raises — backup failures must not block the actual stop/restart.
+    """
+    try:
+        setup = await db.setup.find_one({"_id": SETUP_DOC_ID}, {"_id": 0}) or {}
+        manager_path = setup.get("manager_path")
+        folder_path = doc.get("folder_path")
+        if not (manager_path and folder_path):
+            return
+        server_folder = doc.get("folder_name") or f"Server{doc.get('index', 1)}"
+        res = await asyncio.to_thread(
+            scum_backup.create_backup,
+            server_id=server_id,
+            folder_path=folder_path,
+            manager_path=manager_path,
+            server_folder=server_folder,
+            backup_type=backup_type,
+        )
+        if res.get("ok"):
+            logger.info("Pre-stop backup created for %s", doc.get("name"))
+        else:
+            logger.info("Pre-stop backup skipped: %s", res.get("error"))
+    except Exception as e:
+        logger.info("Pre-stop backup failed (non-fatal): %s", e)
+
+
+async def _do_stop_internal(server_id: str, take_backup: bool = True,
+                            force: bool = False) -> None:
+    """Stop the SCUM process for one server. Best-effort backup, mark expected
+    stop (so crash detector ignores), kill the EXE, set status=Stopped.
+
+    The graceful-shutdown timeout is read from `automation.shutdown_timeout_sec`
+    (default 30s, 0 = instant kill). When `force=True` the timeout is forced
+    to 0 regardless of the setting (used by the UI "Force Stop" button).
+    """
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not doc:
+        return
+    await db.servers.update_one({"id": server_id}, {"$set": {"status": "Stopping"}})
+    if take_backup and doc.get("status") == "Running":
+        await _do_pre_stop_backup(server_id, doc, backup_type="auto")
+    mark_expected_stop(server_id)
+    try:
+        auto = doc.get("automation") or {}
+        timeout = 0 if force else int(auto.get("shutdown_timeout_sec", 30) or 0)
+        await asyncio.to_thread(scum_proc.stop_server, server_id, float(timeout))
+    except Exception:
+        logger.exception("stop failed for %s", server_id)
+    await db.servers.update_one({"id": server_id}, {"$set": {"status": "Stopped"}})
+
+
+async def _do_start_internal(server_id: str, doc: Dict[str, Any]) -> None:
+    """Start the SCUM process for one server (with crash-recovery restore)."""
+    # --- Crash auto-recovery ---------------------------------------------
+    # If the server was flagged for recovery on its previous shutdown (i.e.
+    # scheduler detected an unexpected Running→Stopped transition), restore
+    # the most recent safe backup BEFORE spawning SCUMServer.exe. We prefer
+    # a 'crash' backup (captured at the moment of the crash) and fall back
+    # to the newest 'auto'/'manual' snapshot if none exists.
+    if doc.get("crash_recovery_pending"):
+        try:
+            setup_doc = await db.setup.find_one({"_id": SETUP_DOC_ID}, {"_id": 0}) or {}
+            manager_path = setup_doc.get("manager_path")
+            server_folder = doc.get("folder_name") or f"Server{doc.get('index', 1)}"
+            if manager_path and doc.get("folder_path"):
+                backups = await asyncio.to_thread(
+                    scum_backup.list_backups,
+                    server_id=server_id,
+                    manager_path=manager_path,
+                    server_folder=server_folder,
+                )
+                # Prefer newest crash backup; fallback to newest auto/manual.
+                preferred = next((b for b in backups if b["backup_type"] == "crash"), None)
+                if preferred is None:
+                    preferred = next(
+                        (b for b in backups if b["backup_type"] in ("auto", "manual")),
+                        None,
+                    )
+                if preferred:
+                    logger.warning(
+                        "Crash-recovery: restoring %s before starting %s",
+                        preferred["filename"], doc.get("name"),
+                    )
+                    await asyncio.to_thread(
+                        scum_backup.restore_backup,
+                        server_id=server_id,
+                        folder_path=doc["folder_path"],
+                        manager_path=manager_path,
+                        server_folder=server_folder,
+                        backup_id=preferred["id"],
+                    )
+        except Exception as e:
+            logger.exception("crash-recovery restore failed: %s", e)
+        # Clear the flag regardless — a failed restore shouldn't re-trigger.
+        await db.servers.update_one(
+            {"id": server_id},
+            {"$set": {"crash_recovery_pending": False}},
+        )
+
+    # Real process spawn (Windows only). If not installed or exe missing, fail cleanly.
+    try:
+        port = int(doc.get("game_port") or 7777)
+        query_port = int(doc.get("query_port") or 7778)
+        # scum.MaxPlayers lives in ServerSettings.ini -> srv_general category
+        settings = (doc.get("settings") or {}).get("srv_general") or {}
+        max_players = int(settings.get("scum.MaxPlayers") or doc.get("max_players") or 64)
+        pid = scum_proc.start_server(
+            server_id=server_id,
+            folder_path=doc["folder_path"],
+            port=port,
+            query_port=query_port,
+            max_players=max_players,
+            extra_args=doc.get("launch_args") or "",
+        )
+        await db.servers.update_one({"id": server_id},
+                                    {"$set": {
+                                        "status": "Starting",
+                                        "last_pid": pid,
+                                        "started_at": datetime.now().replace(tzinfo=timezone.utc).isoformat()
+                                    }})
+        doc["status"] = "Starting"
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except OSError as e:
+        if getattr(e, "winerror", 0) == 740 or "[WinError 740]" in str(e):
+            raise HTTPException(
+                status_code=400,
+                detail="İstenen işlem için yükseltme gerekiyor (WinError 740). Lütfen Manager'ı veya arka plan servisini (Backend) Yönetici Olarak Çalıştırın (Run as Administrator)."
+            )
+        raise HTTPException(status_code=500, detail=f"Başlatma hatası: {e}")
+    except RuntimeError as e:
+        # Non-Windows fallback: keep legacy simulated status so UI still works in dev/preview
+        logger.warning("start_server: %s - using simulated status", e)
+        await db.servers.update_one({"id": server_id}, {
+            "$set": {
+                "status": "Running",
+                "started_at": datetime.now().replace(tzinfo=timezone.utc).isoformat()
+            }
+        })
+        doc["status"] = "Running"
+
+
+@api_router.post("/servers/{server_id}/stop", response_model=ServerProfile)
+async def stop_server(server_id: str, force: bool = False):
+    """Stop a server. Pass `?force=true` to skip the graceful save and kill
+    the EXE immediately (used by the dashboard "Force Stop" action)."""
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Server not found")
+    await _do_stop_internal(server_id, take_backup=True, force=force)
+    fresh = await db.servers.find_one({"id": server_id}, {"_id": 0}) or doc
+    return ServerProfile(**fresh)
+
+
+# ---------- legacy stop body removed (now in _do_stop_internal) ----------
+
+
+@api_router.post("/servers/{server_id}/update", response_model=ServerProfile)
+async def update_server(server_id: str):
+    """Update SCUM server binaries via SteamCMD.
+
+    Real SteamCMD `+app_update <id> validate` is idempotent — only changed
+    bytes are downloaded, so we reuse `scum_proc.install_server` with
+    `run_first_boot=False` (don't regenerate configs, don't touch settings).
+    Linux preview keeps the old fast simulation so the UI flow can be tested.
+    """
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Server not found")
+    # SteamCMD update requires a fully stopped EXE — refuse if process is alive.
+    try:
+        live_metrics = scum_proc.get_metrics(server_id, doc.get("folder_path"))
+        if live_metrics.get("running"):
+            raise HTTPException(status_code=409, detail="Stop the server before updating")
+    except HTTPException:
+        raise
+    except Exception:
+        # If metrics probe fails for any reason, fall through — install_server
+        # itself will raise if a process is genuinely alive.
+        pass
+
+    setup = await db.setup.find_one({"_id": SETUP_DOC_ID}, {"_id": 0}) or {}
+    manager_path = setup.get("manager_path") or ""
+
+    # Best-effort pre-update backup of SaveFiles (safe even when stopped —
+    # captures the last known-good state in case SteamCMD corrupts something).
+    await _do_pre_stop_backup(server_id, doc, backup_type="auto")
+
+    # Linux preview / no manager path → keep simulated cycle so UI can be exercised.
+    if platform.system() != "Windows" or not manager_path:
+        mark_expected_stop(server_id)
+        await db.servers.update_one({"id": server_id}, {"$set": {"status": "Updating"}})
+        doc["status"] = "Updating"
+        return ServerProfile(**doc)
+
+    # Real Windows update via SteamCMD in a background thread.
+    def _on_complete(ok: bool, _build_id_unused: Optional[str], _log_tail: str):
+        # Note: scum_proc reports `build-<timestamp>` which is meaningless to
+        # the admin — they expect to see the in-game version (e.g.
+        # '1.2.3.2.115523'). We pull the freshest known SCUM patchnote version
+        # from Steam RSS and persist that as installed_build_id since SteamCMD
+        # just downloaded the latest build.
+        import asyncio as _asyncio
+        async def _update():
+            if ok:
+                info = await _fetch_latest_scum_version()
+                version = info.get("version") or doc.get("installed_build_id")
+                await db.servers.update_one({"id": server_id}, {"$set": {
+                    "status": "Stopped",
+                    "installed_build_id": version,
+                    "update_available": False,
+                }})
+            else:
+                await db.servers.update_one({"id": server_id}, {"$set": {"status": "Stopped"}})
+        try:
+            _asyncio.run(_update())
+        except Exception:
+            logger.exception("update on_complete db update failed")
+
+    scum_proc.install_server(
+        server_id=server_id,
+        folder_path=doc["folder_path"],
+        manager_path=manager_path,
+        app_id=doc.get("steam_app_id") or "3792580",
+        on_complete=_on_complete,
+        run_first_boot=False,  # don't regenerate ini files on update
+    )
+    mark_expected_stop(server_id)
+    await db.servers.update_one({"id": server_id}, {"$set": {"status": "Updating"}})
+    doc["status"] = "Updating"
+    return ServerProfile(**doc)
+
+
+@api_router.post("/servers/{server_id}/update/complete", response_model=ServerProfile)
+async def complete_server_update(server_id: str):
+    """Marks a previously-started update as complete. Called by Electron after SteamCMD exits."""
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Server not found")
+    # Pull latest known Steam build (parsed in-game version like '1.2.3.2.115523')
+    # and set it as installed. Falls back to the previous installed value or
+    # 'unknown' if Steam RSS hasn't been polled yet.
+    meta = await db.app_meta.find_one({"_id": STEAM_LATEST_KEY}, {"_id": 0}) or {}
+    build_id = meta.get("build_id") or doc.get("installed_build_id") or "unknown"
+    await db.servers.update_one({"id": server_id}, {"$set": {
+        "status": "Stopped",
+        "installed_build_id": build_id,
+        "update_available": False,
+    }})
+    doc["status"] = "Stopped"
+    doc["installed_build_id"] = build_id
+    doc["update_available"] = False
+    return ServerProfile(**doc)
+
+
+@api_router.post("/servers/{server_id}/install", response_model=ServerProfile)
+async def install_server(server_id: str):
+    """Download SCUM server files via SteamCMD (AppID 3792580). Runs in a
+    background thread; poll /install/progress for live %. When SteamCMD
+    finishes it marks the server installed."""
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Server not found")
+
+    setup = await db.setup.find_one({"_id": SETUP_DOC_ID}, {"_id": 0}) or {}
+    manager_path = setup.get("manager_path") or ""
+
+    # Non-Windows (dev/preview) — keep legacy simulated install so UI can be exercised.
+    if platform.system() != "Windows" or not manager_path:
+        # Try to stamp the actual latest SCUM version so the UI shows a real
+        # in-game version token (e.g. "1.2.3.2.115523") instead of a fake
+        # build-<timestamp> string.
+        info = await _fetch_latest_scum_version()
+        build_id = info.get("version") or "unknown"
+        await db.servers.update_one({"id": server_id}, {"$set": {
+            "installed": True, "status": "Stopped",
+            "installed_build_id": build_id, "update_available": False,
+        }})
+        doc.update({"installed": True, "status": "Stopped",
+                    "installed_build_id": build_id, "update_available": False})
+        return ServerProfile(**doc)
+
+    # Real Windows install via SteamCMD in a background thread
+    def _on_complete(ok: bool, _build_id_unused: Optional[str], _log_tail: str):
+        import asyncio as _asyncio
+        async def _update():
+            if ok:
+                # Pull the real SCUM in-game version from Steam RSS — SteamCMD
+                # has just finished downloading the latest build so whatever
+                # the RSS reports IS what's now installed locally.
+                info = await _fetch_latest_scum_version()
+                version = info.get("version") or "unknown"
+                update_fields: Dict[str, Any] = {
+                    "installed": True, "status": "Stopped",
+                    "installed_build_id": version, "update_available": False,
+                }
+                # After install + first-boot, parse any generated config files back
+                # into the manager settings so the UI reflects REAL values and any
+                # edits the user makes write to the files SCUM actually reads.
+                try:
+                    parsed = parse_real_config_dir(doc["folder_path"])
+                    current_doc = await db.servers.find_one({"id": server_id}, {"_id": 0}) or doc
+                    current_settings = current_doc.get("settings", {}) or {}
+                    merged = {**current_settings}
+                    for k, v in parsed.items():
+                        if isinstance(v, (list, dict)) and not v:
+                            continue
+                        merged[k] = v
+                    if not parsed.get("notifications"):
+                        merged["notifications"] = current_settings.get("notifications", [])
+                    if not parsed.get("custom_ini"):
+                        merged["custom_ini"] = current_settings.get("custom_ini", {
+                            "ExtraServerSettings": "", "ExtraGameSettings": "", "ExtraEngineSettings": "",
+                        })
+                    update_fields["settings"] = merged
+                except Exception:
+                    logger.exception("install on_complete: parse_real_config_dir failed")
+                await db.servers.update_one({"id": server_id}, {"$set": update_fields})
+            else:
+                await db.servers.update_one({"id": server_id}, {"$set": {"status": "Stopped"}})
+        try:
+            _asyncio.run(_update())
+        except Exception:
+            logger.exception("install on_complete db update failed")
+
+    scum_proc.install_server(
+        server_id=server_id,
+        folder_path=doc["folder_path"],
+        manager_path=manager_path,
+        app_id=doc.get("steam_app_id") or "3792580",
+        on_complete=_on_complete,
+    )
+    await db.servers.update_one({"id": server_id}, {"$set": {"status": "Installing"}})
+    doc["status"] = "Installing"
+    return ServerProfile(**doc)
+
+
+@api_router.get("/servers/{server_id}/install/progress")
+async def install_progress(server_id: str):
+    """Poll this endpoint every 1-2 seconds while an install is running."""
+    return scum_proc.get_install_progress(server_id)
+
+
+@api_router.post("/servers/{server_id}/install/abort")
+async def abort_server_install(server_id: str):
+    """Abort a running server installation or update."""
+    ok = scum_proc.abort_install(server_id)
+    if not ok:
+        raise HTTPException(status_code=400, detail="No running installation found for this server")
+    await db.servers.update_one({"id": server_id}, {"$set": {"status": "Stopped"}})
+    return {"ok": True}
+
+
+@api_router.get("/servers/{server_id}/metrics")
+async def server_metrics(server_id: str):
+    """Live CPU / RAM / uptime / disk usage / last-updated for the given server.
+    Also auto-promotes the DB status from `Starting` → `Running` the moment the
+    SCUM dedicated server answers its Steam A2S_INFO query (true online state)."""
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Server not found")
+    m = scum_proc.get_metrics(server_id, folder_path=doc.get("folder_path"))
+
+    # Reconcile DB status with the live phase. This runs on every UI poll so
+    # within ~1-2s of the server becoming queryable the status flips to Running.
+    phase = m.get("phase")
+    current = doc.get("status")
+    if phase == "online" and current != "Running":
+        await db.servers.update_one({"id": server_id}, {"$set": {"status": "Running"}})
+    elif phase == "stopped" and current in ("Starting", "Running", "Stopping"):
+        await db.servers.update_one({"id": server_id}, {"$set": {"status": "Stopped"}})
+    # (phase == "starting" keeps whatever status is already in DB — typically "Starting".)
+    return m
+
+
+@api_router.get("/servers/{server_id}/activity")
+async def server_activity(server_id: str, hours: int = 24):
+    """Time-series of player count + CPU + memory for the last N hours.
+
+    Samples are captured every 5 minutes by the scheduler. Admin UI renders
+    this as a line chart so spikes + peak hours are visible at a glance.
+    TTL-indexed to 7 days; older data is auto-pruned by Mongo.
+    """
+    hours = max(1, min(int(hours or 24), 24 * 30))
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    rows = await db.server_activity.find(
+        {"server_id": server_id, "ts": {"$gte": cutoff}},
+        {"_id": 0, "server_id": 0},
+    ).sort("ts", 1).to_list(20000)
+    # Convert ts to ISO string for predictable JSON output
+    for r in rows:
+        ts = r.get("ts")
+        if isinstance(ts, datetime):
+            r["ts"] = ts.isoformat()
+    return {"server_id": server_id, "hours": hours, "count": len(rows), "samples": rows}
+
+
+# ---------- AUTOMATION (auto-restart + auto-update) ----------
+def _fmt_update_message(minutes_left: int) -> str:
+    """Default English update warning. Editable in the Update Notifications UI."""
+    return f"A new version of the game is available. It will update and restart in {minutes_left} minutes."
+
+
+def _update_duration_for(minutes_left: int) -> str:
+    """Longer banner at the 1-minute mark (10s) so nobody misses it; 5s earlier."""
+    return "10" if minutes_left == 1 else "5"
+
+
+async def _schedule_graceful_update(server_id: str, server_doc: Dict[str, Any], lead_minutes: int = 15) -> None:
+    """Plan a non-abrupt auto-update.
+
+    User request (2026-02): default countdown chat broadcasts are no longer
+    auto-stamped. The update still happens at target time, but no
+    "A new version is available in N minutes" messages are written. If admins
+    want pre-update warnings they add them manually in the Notifications UI.
+
+    1. Compute target time = now + lead_minutes.
+    2. Set pending_update_at so the scheduler tick triggers the actual stop →
+       SteamCMD update → restart exactly at target time.
+    3. Strip any stale transient update notifications from a previous run.
+
+    Safe to call multiple times; no-op if an update is already pending.
+    """
+    if server_doc.get("pending_update_at"):
+        return  # already scheduled
+    now = datetime.now(timezone.utc)
+    target = now + timedelta(minutes=lead_minutes)
+    settings = {**(server_doc.get("settings") or {})}
+    notifs = [dict(n) for n in (settings.get("notifications") or [])]
+    # Drop any stale transient update notifications from a previous cycle.
+    notifs = [n for n in notifs if not n.get("_transient_update")]
+    settings["notifications"] = notifs
+    await db.servers.update_one(
+        {"id": server_id},
+        {"$set": {
+            "settings": settings,
+            "pending_update_at": target.isoformat(),
+        }},
+    )
+    # Write to disk so SCUM picks up the cleaned notifications list
+    try:
+        if server_doc.get("folder_path"):
+            save_notifications_to_disk(server_doc["folder_path"], notifs)
+    except Exception as e:
+        logger.info("graceful-update notification write failed: %s", e)
+    logger.info(
+        "Graceful update scheduled for %s at %s (no chat warnings)",
+        server_doc.get("name"), target.isoformat(),
+    )
+
+
+def save_notifications_to_disk(folder_path: str, notifs: List[Dict[str, Any]]) -> None:
+    """Write Notifications.json to the server's config dir, stripping manager
+    metadata (kind, _transient_update) that SCUM doesn't understand."""
+    from pathlib import Path
+    clean = []
+    for n in notifs:
+        if isinstance(n, dict):
+            clean.append({k: v for k, v in n.items() if not k.startswith("_") and k != "kind"})
+    target = Path(folder_path) / "SCUM" / "Saved" / "Config" / "WindowsServer" / "Notifications.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json_lib.dumps({"Notifications": clean}, indent=2), encoding="utf-8")
+
+
+
+def _fmt_restart_message(minutes_left: int) -> str:
+    """Default restart warning. Users are expected to edit these in the
+    Notifications editor to fit their community's language."""
+    return f"The server will restart in {minutes_left} minutes."
+
+
+def _restart_duration_for(minutes_left: int) -> str:
+    """On-screen banner duration. The final 1-minute warning stays 10s for
+    extra visibility; the earlier reminders are 5s each so they don't spam
+    the screen during active play."""
+    return "10" if minutes_left == 1 else "5"
+
+
+def _minus_minutes(hhmm: str, m: int) -> str:
+    """Subtract m minutes from HH:MM and wrap around 24h."""
+    h, mi = [int(x) for x in hhmm.split(":")[:2]]
+    total = (h * 60 + mi - m) % (24 * 60)
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def _generate_notifications_from_schedule(automation: Dict[str, Any], existing_notifications: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    """Generate RESTART notifications from the schedule automatically.
+    Creates 60m, 45m, 30m, 15m, and 5-to-0m countdown warnings using SCUM's
+    native #RestartIn(HH:MM) placeholder.
+    Handles midnight wrap-around: warnings scheduled before 00:00 for a 00:00-00:45
+    restart are correctly mapped to the previous day.
+    Preserves custom message prefixes from existing_notifications, defaulting to
+    'Server Restart' if none exists.
+    """
+    if not automation.get("enabled"):
+        return []
+
+    restart_times = automation.get("restart_times") or []
+    restart_days = automation.get("restart_days") or ["sun", "mon", "tue", "wed", "thu", "fri", "sat"]
+
+    # Extract existing prefixes to keep them during schedule updates / regeneration
+    custom_prefixes = {}
+    if existing_notifications:
+        for n in existing_notifications:
+            if not isinstance(n, dict):
+                continue
+            msg = n.get("message") or ""
+            # Match #RestartIn(HH:MM)
+            match = re.search(r"#RestartIn\((\d{2}:\d{2})\)", msg)
+            if match:
+                target_hhmm = match.group(1)
+                placeholder = match.group(0)
+                prefix = msg.replace(placeholder, "").strip()
+                if prefix and target_hhmm not in custom_prefixes:
+                    custom_prefixes[target_hhmm] = prefix
+
+    DAY_MAP = {
+        "sun": "Sunday",
+        "mon": "Monday",
+        "tue": "Tuesday",
+        "wed": "Wednesday",
+        "thu": "Thursday",
+        "fri": "Friday",
+        "sat": "Saturday"
+    }
+
+    PREV_DAY = {
+        "Everyday": "Everyday",
+        "Sunday": "Saturday",
+        "Monday": "Sunday",
+        "Tuesday": "Monday",
+        "Wednesday": "Tuesday",
+        "Thursday": "Wednesday",
+        "Friday": "Thursday",
+        "Saturday": "Friday"
+    }
+
+    if not restart_days or len(restart_days) == 7:
+        days_to_gen = ["Everyday"]
+    else:
+        days_to_gen = [DAY_MAP[d] for d in restart_days if d in DAY_MAP]
+
+    notifs = []
+    for hhmm in restart_times:
+        if not re.match(r"^\d{2}:\d{2}$", hhmm):
+            continue
+        try:
+            h, mi = [int(x) for x in hhmm.split(":")[:2]]
+            hhmm_mins = h * 60 + mi
+
+            # Get prefix for this time slot (default to "Server Restart" if not customized)
+            prefix = custom_prefixes.get(hhmm, "Server Restart")
+            msg_text = f"{prefix} #RestartIn({hhmm})"
+
+            # We evaluate each warning minute offset: 60m, 45m, 30m, 15m, 5-0m range.
+            # To handle range t_5_range (e.g. "23:55-00:00" or "00:25-00:30"),
+            # the day is determined by its start time (e.g. 5 minutes before restart).
+            warnings = [
+                (60, _minus_minutes(hhmm, 60)),
+                (45, _minus_minutes(hhmm, 45)),
+                (30, _minus_minutes(hhmm, 30)),
+                (15, _minus_minutes(hhmm, 15)),
+                (5, f"{_minus_minutes(hhmm, 5)}-{hhmm}")
+            ]
+
+            # Separate into wrapped (previous day) and non-wrapped (current day)
+            wrapped_times = []
+            current_times = []
+
+            for offset, time_str in warnings:
+                if hhmm_mins - offset < 0:
+                    wrapped_times.append(time_str)
+                else:
+                    current_times.append(time_str)
+
+            for day in days_to_gen:
+                if wrapped_times:
+                    prev_day = PREV_DAY.get(day, day)
+                    notifs.append({
+                        "day": prev_day,
+                        "time": wrapped_times,
+                        "duration": "10",
+                        "color": "255-180-50",
+                        "message": msg_text,
+                        "kind": "restart"
+                    })
+                if current_times:
+                    notifs.append({
+                        "day": day,
+                        "time": current_times,
+                        "duration": "10",
+                        "color": "255-180-50",
+                        "message": msg_text,
+                        "kind": "restart"
+                    })
+        except Exception as e:
+            logger.info("Failed to generate restart warning for %s: %s", hhmm, e)
+
+    return notifs
+
+
+@api_router.put("/servers/{server_id}/automation", response_model=ServerProfile)
+async def update_automation(server_id: str, payload: AutomationUpdate):
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Server not found")
+    automation = {**(doc.get("automation") or {})}
+    for k, v in payload.model_dump(exclude_none=True).items():
+        automation[k] = v
+    await db.servers.update_one({"id": server_id}, {"$set": {"automation": automation}})
+    doc["automation"] = automation
+
+    # Auto-regenerate restart warnings so they stay in sync with the new schedule
+    try:
+        settings = {**(doc.get("settings") or {})}
+        existing = settings.get("notifications") or []
+        generated = _generate_notifications_from_schedule(automation, existing)
+        kept = [n for n in existing if isinstance(n, dict) and (n.get("kind") or "restart") != "restart"]
+        
+        # Merge new auto-generated ones
+        for n in generated:
+            n["_lgss_auto"] = True
+            
+        merged = generated + kept
+        settings["notifications"] = merged
+        await db.servers.update_one({"id": server_id}, {"$set": {"settings": settings}})
+        doc["settings"] = settings
+
+        if doc.get("folder_path"):
+            save_notifications_to_disk(doc["folder_path"], merged)
+    except Exception as e:
+        logger.info("Auto-regeneration of notifications failed during automation update: %s", e)
+
+    return ServerProfile(**doc)
+
+
+@api_router.post("/servers/{server_id}/automation/generate-notifications", response_model=ServerProfile)
+async def generate_notifications(server_id: str):
+    """Regenerate the Notifications.json entries from the current automation schedule,
+    write them into the server's settings.notifications list and write to disk immediately."""
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Server not found")
+    automation = doc.get("automation") or {}
+    settings = {**(doc.get("settings") or {})}
+    existing = settings.get("notifications") or []
+    generated = _generate_notifications_from_schedule(automation, existing)
+    kept = [n for n in existing if isinstance(n, dict) and (n.get("kind") or "restart") != "restart"]
+    settings["notifications"] = generated + kept
+    await db.servers.update_one({"id": server_id}, {"$set": {"settings": settings}})
+    
+    # Save directly to WindowsServer/Notifications.json
+    if doc.get("installed") and doc.get("folder_path"):
+        try:
+            save_notifications_to_disk(doc["folder_path"], settings["notifications"])
+        except Exception as e:
+            logger.info("Failed to auto-write Notifications.json on regeneration for %s: %s", server_id, e)
+            
+    doc["settings"] = settings
+    return ServerProfile(**doc)
+
+
+@api_router.post("/servers/{server_id}/post-install", response_model=ServerProfile)
+async def server_post_install(server_id: str):
+    """Called after SteamCMD install finishes. Seeds a helpful default
+    Notifications.json template (2x daily restarts) so new admins have a starting point."""
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Server not found")
+    settings = {**(doc.get("settings") or {})}
+    if not settings.get("notifications"):
+        # Seed with empty list — admins author chat warnings manually now.
+        settings["notifications"] = _generate_notifications_from_schedule({})
+        await db.servers.update_one({"id": server_id}, {"$set": {"settings": settings}})
+        doc["settings"] = settings
+    return ServerProfile(**doc)
+
+
+# ---------- STEAM UPDATE CHECK ----------
+class SteamUpdateInfo(BaseModel):
+    app_id: str
+    latest_build_id: str
+    checked_at: str
+    change_notes: Optional[str] = ""
+
+
+STEAM_APP_ID = "3792580"
+STEAM_LATEST_KEY = "steam-latest-manifest"
+
+
+# Regex matches SCUM's in-game build version format: "1.2.3.2.115523" (preferred,
+# 5 segments) and "1.2.3.2" (4-segment fallback). These are what Steam patchnotes
+# titles look like (e.g., "Hotfix - 1.2.3.2.115523") and what's displayed in the
+# game's main menu (`Build Version: 1.2.3.2.115523`). We DO NOT use epoch
+# timestamps or Steam's internal numeric buildid because admins compare the
+# manager's "latest build" against the version they see in-game.
+# v1.0.36 KRITIK BUG FIX:
+# SHORT regex (\d+\.\d+\.\d+\.\d+) IP adresleriyle eşleşiyordu! Kullanıcı şikayeti:
+# "Manager'da build version 51.222.255.64 gibi gösteriyor" — Steam RSS feed'inde
+# bir IP geçtiğinde (community post, server-list scrape) SHORT regex onu version
+# diye yakalıyordu. SCUM build version'ları HER ZAMAN 5-oktet (örn 1.3.0.2.119181),
+# 4-oktet hiç olmamış. SHORT regex'i kaldırıyoruz. Eğer ileride 4-oktet versiyon
+# çıkarsa, ekleyeceğimiz regex IP-olmadığını doğrulamalı (ilk oktet 1 veya 2,
+# ya da son oktet 4+ haneli — IP'ler genelde 3 haneli en fazla).
+_SCUM_VERSION_RE_LONG = re.compile(r"(?:^|[^\d.])(\d+\.\d+\.\d+\.\d+\.\d{3,})(?=[^\d.]|$)")
+# 4-oktet IP-benzeri formatı KASITLI olarak ELE ALMIYORUZ — false-positive
+# olarak IP yakalama riski var (bkz. v1.0.36 fix). Eğer Steam SCUM versiyonunu
+# 4-oktet yayımlamaya başlarsa bu regex'i şu kuralla eklemeliyiz:
+# son oktet 4+ haneli olmalı VE 0.0.0.0..255.255.255.255 aralığında olmamalı.
+
+
+def _parse_scum_version(text: str) -> Optional[str]:
+    """Extract a SCUM in-game build version (e.g. '1.2.3.2.115523') from
+    arbitrary text — Steam RSS titles, patch-note descriptions, etc.
+    Returns None if no version-like token is found.
+    """
+    if not text:
+        return None
+    m = _SCUM_VERSION_RE_LONG.search(text)
+    return m.group(1) if m else None
+
+
+async def _fetch_latest_scum_version() -> Dict[str, Any]:
+    """Fetch the latest SCUM in-game build version from Steam's PUBLIC RSS feed
+    and return {version, notes, source} (or {} on failure).
+
+    Walks items newest→oldest and returns the first one whose title/description
+    contains a SCUM version token, preferring patchnote-style items over
+    generic community posts. SCUM's RSS titles look like:
+      "Hotfix - 1.2.3.2.115523"
+      "Patch notes - 1.2.3.2.115523"
+      "SCUM 1.2.3.2 update"
+    We DON'T care which appid (513710 main game / 3792580 dedicated) — the
+    server patches lockstep with the game, so either is the right token.
+    """
+    import httpx
+    CANDIDATE_APPIDS = ["513710", "3792580"]
+    try:
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True,
+                                     headers={"User-Agent": "LGSSManager/1.0"}) as client:
+            for aid in CANDIDATE_APPIDS:
+                r = await client.get(f"https://steamcommunity.com/games/{aid}/rss/")
+                if r.status_code != 200 or "<item>" not in r.text:
+                    continue
+                # Parse each <item> block — extract title + description so we
+                # can look at both fields for a version token.
+                item_blocks = re.findall(r"<item>(.*?)</item>", r.text, flags=re.S)
+                for block in item_blocks:
+                    title_m = re.search(r"<title>([^<]+)</title>", block)
+                    desc_m = re.search(r"<description>(.*?)</description>", block, flags=re.S)
+                    title = (title_m.group(1) if title_m else "").strip()
+                    desc = (desc_m.group(1) if desc_m else "").strip()
+                    version = _parse_scum_version(title) or _parse_scum_version(desc)
+                    if version:
+                        return {"version": version, "notes": title, "source": f"steam-rss:{aid}"}
+        return {}
+    except Exception as e:
+        logger.info("Steam RSS version parse failed: %s", e)
+        return {}
+
+
+@api_router.get("/steam/check-update")
+async def steam_check_update():
+    """Check Steam for the latest SCUM update.
+
+    Parses the SCUM patchnote RSS feed and extracts the in-game version
+    token (e.g. '1.2.3.2.115523'). This is what admins see both in-game
+    (main menu "Build Version") and in Steam's update notification, so
+    they can recognize whether a new patch is out at a glance.
+    """
+    info = await _fetch_latest_scum_version()
+    latest_build_id = info.get("version")
+    notes = info.get("notes", "")
+    fetched_from = info.get("source", "mock")
+
+    if not latest_build_id:
+        # Final fallback: whatever the admin has simulated via /api/steam/publish-build
+        doc = await db.app_meta.find_one({"_id": STEAM_LATEST_KEY}, {"_id": 0}) or {}
+        latest_build_id = doc.get("build_id") or "unknown"
+        notes = doc.get("notes", "")
+
+    checked_at = datetime.now(timezone.utc).isoformat()
+    # Persist for other endpoints + compare to installed builds
+    await db.app_meta.update_one(
+        {"_id": STEAM_LATEST_KEY},
+        {"$set": {"build_id": latest_build_id, "notes": notes, "checked_at": checked_at, "source": fetched_from}},
+        upsert=True,
+    )
+    # Mark servers whose installed build differs as update_available. A version
+    # of "unknown" must never trigger an update prompt — it just means the RSS
+    # parse failed and we have nothing to compare against.
+    if latest_build_id and latest_build_id != "unknown":
+        servers = await db.servers.find({"installed": True}, {"_id": 0}).to_list(500)
+        for s in servers:
+            needs_update = bool(s.get("installed_build_id")) and s["installed_build_id"] != latest_build_id
+            if needs_update != bool(s.get("update_available")):
+                await db.servers.update_one({"id": s["id"]}, {"$set": {"update_available": needs_update}})
+    return {
+        "app_id": STEAM_APP_ID,
+        "latest_build_id": latest_build_id,
+        "checked_at": checked_at,
+        "change_notes": notes,
+        "source": fetched_from,
+    }
+
+
+class SteamPublishBuild(BaseModel):
+    build_id: str
+    notes: Optional[str] = ""
+
+
+@api_router.post("/steam/publish-build")
+async def steam_publish_build(payload: SteamPublishBuild):
+    """Admin/simulation endpoint: pretends a new Steam build has been published.
+    Used in web preview to exercise the update-available flow without real SteamCMD."""
+    await db.app_meta.update_one(
+        {"_id": STEAM_LATEST_KEY},
+        {"$set": {"build_id": payload.build_id, "notes": payload.notes, "published_at": datetime.now(timezone.utc).isoformat()}},
+        upsert=True,
+    )
+    await db.servers.update_many({"installed": True, "installed_build_id": {"$ne": payload.build_id}}, {"$set": {"update_available": True}})
+    return {"ok": True, "latest_build_id": payload.build_id}
+
+
+# ---------- LOG INGESTION / EVENTS / DISCORD ----------
+from scum_logs import parse_log_text, detect_log_type, read_log_file, LOG_TYPE_ORDER, get_new_log_text  # noqa: E402
+
+
+class DiscordWebhookConfig(BaseModel):
+    admin: Optional[str] = ""
+    chat: Optional[str] = ""
+    login: Optional[str] = ""
+    kill: Optional[str] = ""
+    economy: Optional[str] = ""
+    violation: Optional[str] = ""
+    fame: Optional[str] = ""
+    raid: Optional[str] = ""
+    # Lifecycle hooks — fire on every scheduled auto-restart / auto-update.
+    # Separate from `admin` so admins can route ops notifications to a #ops
+    # channel and gameplay notifications to #game-events.
+    auto_restart: Optional[str] = ""
+    auto_update: Optional[str] = ""
+    mention_role_id: Optional[str] = ""  # pinged on violation events
+
+
+def _event_to_discord_embed(ev: Dict[str, Any]) -> Dict[str, Any]:
+    palette = {
+        "admin":     (0xFF8C00, "🛠 Admin"),
+        "chat":      (0x00C9FF, "💬 Chat"),
+        "login":     (0x22D36F, "🔐 Login"),
+        "kill":      (0xE53935, "💀 Kill"),
+        "economy":   (0xFFD166, "💰 Trade"),
+        "violation": (0xD32F2F, "🚨 Violation"),
+        "fame":      (0x9B59B6, "🏆 Fame"),
+        "raid":      (0x607D8B, "⚔ Raid"),
+        # Lifecycle events — distinct colours so admins can spot them at a
+        # glance in a busy Discord channel.
+        "auto_restart": (0x00B8D4, "🔄 Auto-Restart"),
+        "auto_update":  (0x1E88E5, "⬇ Auto-Update"),
+    }
+    color, title = palette.get(ev.get("type", ""), (0x8B9A46, f"· {ev.get('type','event').upper()}"))
+    # v1.0.36 — Robust name fallback. SCUM 1.3 log format occasionally writes
+    # entries without the quoted `'76561...Player(123)'` header (e.g. system
+    # admin actions, or some chat scenarios when the player has special chars
+    # in their nick). Before this fix the Discord embed showed bare `?` and
+    # admins couldn't tell who did what. Now we walk a 3-level chain:
+    #   1. The parsed name fields (player_name / killer_name)
+    #   2. The Steam ID (always present in the raw line — guaranteed unique)
+    #   3. A literal "Unknown" so the embed never says raw `?`.
+    def _pretty_name(name, sid):
+        if name and name.strip():
+            return name.strip()
+        if sid:
+            return f"SteamID:{str(sid)[-6:]}"  # last 6 digits is enough to ID
+        return "Unknown"
+    player = _pretty_name(ev.get("player_name") or ev.get("killer_name"),
+                          ev.get("steam_id") or ev.get("killer_steam_id"))
+    desc_lines: List[str] = []
+    if ev["type"] == "admin":
+        desc_lines.append(f"**{player}** ran `{ev.get('command','?')}` {ev.get('args','')}")
+    elif ev["type"] == "chat":
+        desc_lines.append(f"[{ev.get('channel','?')}] **{player}**: {ev.get('message','')}")
+    elif ev["type"] == "login":
+        desc_lines.append(f"**{player}** {ev.get('action','?')}")
+    elif ev["type"] == "kill":
+        killer = _pretty_name(ev.get("killer_name"), ev.get("killer_steam_id"))
+        victim = _pretty_name(ev.get("victim_name"), ev.get("victim_steam_id"))
+        desc_lines.append(f"**{killer}** killed **{victim}** with `{ev.get('weapon','?')}` · {ev.get('distance_m') or 0:.0f}m")
+    elif ev["type"] == "economy":
+        desc_lines.append(f"**{player}** {ev.get('action','?')} {ev.get('quantity',1)}× `{ev.get('item_code','?')}` for {ev.get('amount',0)} @ {ev.get('trader','?')}")
+    elif ev["type"] == "violation":
+        desc_lines.append(f"⚠ **{player}** — {ev.get('description','')}")
+    elif ev["type"] == "fame":
+        d = ev.get("delta", 0)
+        desc_lines.append(f"**{player}** {'gained' if d >= 0 else 'lost'} {abs(d)} fame")
+    elif ev["type"] in ("auto_restart", "auto_update"):
+        # Lifecycle events use a structured `message` field instead of action+player.
+        desc_lines.append(ev.get("message", "(no details)"))
+    else:
+        desc_lines.append(ev.get("raw", ""))
+    return {
+        "embeds": [{
+            "title": title,
+            "description": "\n".join(desc_lines)[:1800],
+            "color": color,
+            "timestamp": ev.get("ts"),
+            "footer": {"text": f"Server {ev.get('server_id','')[:8]} · {ev.get('source_file','')}"},
+        }]
+    }
+
+
+def _build_discord_embed_obj(ev: Dict[str, Any]):
+    """Convert an event into a `discord.Embed` for the bot to post.
+
+    Separate function (not lambda) so the bot import is local — avoids
+    pulling discord.py into the module load path when the user isn't
+    running the bot at all.
+    """
+    import discord  # local import; only needed when bot is active
+    payload = _event_to_discord_embed(ev)
+    embed_dict = (payload.get("embeds") or [{}])[0]
+    embed = discord.Embed(
+        title=embed_dict.get("title", ""),
+        description=embed_dict.get("description", ""),
+        color=embed_dict.get("color", 0x546E7A),
+    )
+    if embed_dict.get("timestamp"):
+        try:
+            embed.timestamp = datetime.fromisoformat(embed_dict["timestamp"].replace("Z", "+00:00"))
+        except Exception:
+            pass
+    if embed_dict.get("footer"):
+        embed.set_footer(text=embed_dict["footer"].get("text", ""))
+    return embed
+
+
+async def _forward_to_discord(server_id: str, webhooks: Dict[str, Any],
+                              events: List[Dict[str, Any]]) -> int:
+    """Route events to THIS server's Discord transport. v1.0.37g:
+       - Per-server bot is the primary transport. If the bot for `server_id`
+         is running AND has a channel mapped for the event type, it posts the
+         embed.
+       - Legacy per-server webhooks remain as a fallback for events the bot
+         didn't handle (admins migrating from the webhook UI).
+    """
+    sent = 0
+    bot_routed: set = set()  # which event ids the bot already handled
+
+    if scum_discord.is_running(server_id):
+        for ev in events:
+            ok = await scum_discord.push_event(server_id, ev, _build_discord_embed_obj)
+            if ok:
+                sent += 1
+                bot_routed.add(id(ev))
+
+    if not webhooks:
+        return sent
+    import httpx
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        for ev in events:
+            if id(ev) in bot_routed:
+                continue
+            hook = (webhooks.get(ev.get("type")) or "").strip()
+            if not hook or not hook.startswith("https://discord"):
+                continue
+            payload = _event_to_discord_embed(ev)
+            if ev.get("type") == "violation" and webhooks.get("mention_role_id"):
+                payload["content"] = f"<@&{webhooks['mention_role_id']}>"
+            try:
+                r = await client.post(hook, json=payload)
+                if r.status_code < 400:
+                    sent += 1
+            except Exception as e:
+                logger.info("Discord POST failed: %s", e)
+    return sent
+
+
+async def _store_events_and_forward(server_id: str, events: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Store events in MongoDB (de-duplicated by 'id') and forward ONLY the
+    freshly-inserted ones to the server's Discord hooks. Previously we forwarded
+    the full batch if any insert succeeded, which caused Discord to re-announce
+    old events every time a log file grew (the "player re-joined every 30 min"
+    and "admin ran ? repeatedly" bugs)."""
+    if not events:
+        return {"stored": 0, "forwarded": 0}
+    srv = await db.servers.find_one({"id": server_id}, {"_id": 0, "discord_webhooks": 1}) or {}
+    hooks = srv.get("discord_webhooks") or {}
+    newly_inserted: List[Dict[str, Any]] = []
+    for ev in events:
+        try:
+            res = await db.server_events.update_one({"id": ev["id"]}, {"$setOnInsert": ev}, upsert=True)
+            if res.upserted_id is not None:
+                newly_inserted.append(ev)
+        except Exception as e:
+            logger.info("event store failed: %s", e)
+    sent = 0
+    if newly_inserted:
+        # Hard cap so a big initial ingest doesn't blast a Discord channel with 500+ embeds
+        to_send = newly_inserted[-200:]
+        sent = await _forward_to_discord(server_id, hooks, to_send)
+    return {"stored": len(newly_inserted), "forwarded": sent}
+
+
+async def _notify_lifecycle(server_id: str, kind: str, message: str,
+                            server_doc: Optional[Dict[str, Any]] = None) -> None:
+    """Send a one-shot Discord webhook for a manager-driven lifecycle event
+    (auto_restart / auto_update). These are NOT log-parsed events — they're
+    fired directly by the scheduler — so they bypass `_store_events_and_forward`
+    (which is for log/db parsed events) and don't pollute the event history.
+
+    `kind` must be one of: 'auto_restart', 'auto_update'.
+    `message` is the human-readable summary shown in the embed body
+             (e.g. "Server1 will restart in 15 min").
+    """
+    if kind not in ("auto_restart", "auto_update"):
+        return
+    try:
+        if server_doc is None:
+            server_doc = await db.servers.find_one(
+                {"id": server_id}, {"_id": 0, "name": 1, "discord_webhooks": 1, "discord_bot": 1}
+            ) or {}
+        hooks = server_doc.get("discord_webhooks") or {}
+        bot_cfg = server_doc.get("discord_bot") or {}
+        bot_enabled = bot_cfg.get("enabled", False)
+        bot_events = bot_cfg.get("event_channels") or {}
+
+        webhook_ok = bool(hooks.get(kind))
+        bot_ok = bool(bot_enabled and bot_events.get(kind, {}).get("channel_id"))
+
+        if not webhook_ok and not bot_ok:
+            return  # Neither webhook nor bot is configured — nothing to do.
+
+        ev = {
+            "type": kind,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "server_id": server_id,
+            "source_file": "manager",
+            "player_name": server_doc.get("name", "Server"),
+            "message": message,
+            "raw": message,
+        }
+        await _forward_to_discord(server_id, hooks, [ev])
+    except Exception as e:
+        logger.info("lifecycle webhook (%s) failed: %s", kind, e)
+
+
+@api_router.post("/servers/{server_id}/logs/import")
+async def import_server_log(server_id: str, file: UploadFile = File(...)):
+    """Upload a SCUM log file (UTF-16) and parse+store its events.
+
+    Useful for web preview where no real SCUM server is running: the admin can drag
+    a real log here and immediately see kills/chat/admin/economy feeds + Discord relays.
+    """
+    srv = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not srv:
+        raise HTTPException(status_code=404, detail="Server not found")
+    raw = await file.read()
+    from scum_logs import _decode_scum_log_bytes
+    text = _decode_scum_log_bytes(raw)
+    log_type = detect_log_type(file.filename or "")
+    events = parse_log_text(text, log_type, filename=file.filename or "", server_id=server_id)
+    res = await _store_events_and_forward(server_id, events)
+    return {"log_type": log_type, "parsed": len(events), **res, "filename": file.filename}
+
+
+# ---------------------------------------------------------------------------
+#  Backup endpoints — SaveFiles zip snapshots
+# ---------------------------------------------------------------------------
+async def _get_server_for_backup(server_id: str) -> Dict[str, Any]:
+    """Resolve server doc + manager_path context. Raises HTTPException if missing."""
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Server not found")
+    setup = await db.setup.find_one({"_id": SETUP_DOC_ID}, {"_id": 0}) or {}
+    manager_path = setup.get("manager_path")
+    if not manager_path:
+        raise HTTPException(status_code=400, detail="Manager path not configured")
+    return {
+        "doc": doc,
+        "manager_path": manager_path,
+        "server_folder": doc.get("folder_name") or f"Server{doc.get('index', 1)}",
+    }
+
+
+@api_router.get("/servers/{server_id}/backups")
+async def list_server_backups(server_id: str):
+    ctx = await _get_server_for_backup(server_id)
+    backups = await asyncio.to_thread(
+        scum_backup.list_backups,
+        server_id=server_id,
+        manager_path=ctx["manager_path"],
+        server_folder=ctx["server_folder"],
+    )
+    total = sum(b["size_bytes"] for b in backups)
+    return {
+        "server_id": server_id,
+        "count": len(backups),
+        "total_size_mb": round(total / (1024 * 1024), 2),
+        "backups": backups,
+    }
+
+
+@api_router.post("/servers/{server_id}/backups")
+async def create_server_backup(server_id: str, backup_type: str = "manual"):
+    """Create an on-demand ZIP backup of SaveFiles. Non-blocking; completes
+    within 5-30 seconds depending on save size. Safe while server is running
+    — SCUM.db is copied via SQLite's online backup API."""
+    ctx = await _get_server_for_backup(server_id)
+    res = await asyncio.to_thread(
+        scum_backup.create_backup,
+        server_id=server_id,
+        folder_path=ctx["doc"]["folder_path"],
+        manager_path=ctx["manager_path"],
+        server_folder=ctx["server_folder"],
+        backup_type=backup_type,
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=500, detail=res.get("error", "backup failed"))
+    return res
+
+
+@api_router.delete("/servers/{server_id}/backups/{backup_id}")
+async def delete_server_backup(server_id: str, backup_id: str):
+    ctx = await _get_server_for_backup(server_id)
+    ok = await asyncio.to_thread(
+        scum_backup.delete_backup,
+        manager_path=ctx["manager_path"],
+        server_folder=ctx["server_folder"],
+        backup_id=backup_id,
+    )
+    if not ok:
+        raise HTTPException(status_code=404, detail="Backup not found")
+    return {"ok": True}
+
+
+@api_router.post("/servers/{server_id}/backups/{backup_id}/restore")
+async def restore_server_backup(server_id: str, backup_id: str):
+    """Restore a backup into SaveFiles. REQUIRES the server to be Stopped —
+    we refuse if the SCUM process is alive to avoid clobbering live DB files
+    and corrupting mid-write tables. A `pre_restore` safety backup is
+    automatically captured before extraction."""
+    ctx = await _get_server_for_backup(server_id)
+    # Check running state (DB status + real OS process)
+    metrics = scum_proc.get_metrics(server_id, folder_path=ctx["doc"].get("folder_path"))
+    if metrics.get("running") or ctx["doc"].get("status") in ("Running", "Starting"):
+        raise HTTPException(status_code=409, detail="Stop the server before restoring")
+    res = await asyncio.to_thread(
+        scum_backup.restore_backup,
+        server_id=server_id,
+        folder_path=ctx["doc"]["folder_path"],
+        manager_path=ctx["manager_path"],
+        server_folder=ctx["server_folder"],
+        backup_id=backup_id,
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=500, detail=res.get("error", "restore failed"))
+    return res
+
+
+@api_router.get("/servers/{server_id}/backups/{backup_id}/download")
+async def download_server_backup(server_id: str, backup_id: str):
+    """Stream a backup zip back to the admin for off-machine archiving."""
+    ctx = await _get_server_for_backup(server_id)
+    p = scum_backup.find_backup(
+        manager_path=ctx["manager_path"],
+        server_folder=ctx["server_folder"],
+        backup_id=backup_id,
+    )
+    if p is None or not p.exists():
+        raise HTTPException(status_code=404, detail="Backup not found")
+    from fastapi.responses import FileResponse
+    return FileResponse(str(p), media_type="application/zip", filename=p.name)
+
+
+# ============================================================
+# Discord Bot — token management + state collector
+# ============================================================
+
+class DiscordBotConfig(BaseModel):
+    enabled: Optional[bool] = None
+    token: Optional[str] = None
+    status_guild_id: Optional[str] = None
+    status_channel_id: Optional[str] = None
+    event_channels: Optional[Dict[str, Any]] = None
+    embed_title: Optional[str] = None
+    embed_color: Optional[str] = None
+    embed_image: Optional[str] = None
+    embed_footer: Optional[str] = None
+    hide_player_names: Optional[bool] = None
+
+
+# Per-server state cache. Keyed by server_id, refreshed every scheduler tick
+# (~10s). Each bot's `state_fn` reads ONLY its own server snapshot.
+_discord_state_cache: Dict[str, Dict[str, Any]] = {}
+
+
+def _make_discord_state_fn(server_id: str):
+    """Return a closure the per-server bot can call to fetch its current
+    state. We return a fresh closure per server so each bot sees only its
+    own snapshot (no cross-server data leaking into one bot's embeds)."""
+    def _fn() -> Optional[Dict[str, Any]]:
+        return _discord_state_cache.get(server_id)
+    return _fn
+
+
+def _make_discord_msg_id_store(server_id: str):
+    """Return an async callback the bot uses to persist its status-message
+    id into THIS server's profile (so the next backend restart edits the
+    same embed instead of posting a duplicate)."""
+    async def _store(sid: str, message_id: str) -> None:
+        # sid is the server_id key the bot passes back — must match
+        await db.servers.update_one(
+            {"id": sid or server_id},
+            {"$set": {"discord_bot.status_message_id": message_id}},
+        )
+    return _store
+
+
+async def _refresh_discord_state_cache():
+    """Rebuild the per-server Discord state cache from database log-parsed logins
+    and local settings (independent of A2S query ports).
+    Called once per scheduler tick. Each managed server gets one snapshot,
+    and each per-server bot reads only its own entry."""
+    new_cache: Dict[str, Dict[str, Any]] = {}
+    now_ts = datetime.now(timezone.utc).timestamp()
+    now_dt = datetime.now().replace(tzinfo=timezone.utc)
+    STALE_LOGIN_HOURS = 12
+
+    async for s in db.servers.find({}, {"_id": 0}):
+        query_port = int(s.get("query_port") or 7778)
+        max_p = int((s.get("settings") or {}).get("srv_general", {}).get("scum.MaxPlayers")
+                    or s.get("max_players") or 64)
+        metrics = scum_proc.get_metrics(s["id"], s.get("folder_path"))
+        server_running = s.get("status") == "Running" and bool(metrics.get("ready"))
+
+        players: List[Dict[str, Any]] = []
+        if server_running:
+            try:
+                # 1. Fetch last activity per steam_id
+                pipeline = [
+                    {"$match": {"server_id": s["id"], "steam_id": {"$nin": [None, ""]}}},
+                    {"$sort": {"ts": 1}},
+                    {"$group": {
+                        "_id": "$steam_id",
+                        "last_name": {"$last": "$player_name"},
+                        "last_seen": {"$last": "$ts"},
+                    }},
+                ]
+                rows = await db.server_events.aggregate(pipeline).to_list(10000)
+
+                # 2. Fetch login/logout states
+                login_pipe = [
+                    {"$match": {"server_id": s["id"], "type": "login", "steam_id": {"$nin": [None, ""]}}},
+                    {"$sort": {"ts": 1}},
+                    {"$group": {
+                        "_id": "$steam_id",
+                        "last_login_action": {"$last": "$action"},
+                        "last_login_ts": {"$last": "$ts"},
+                    }},
+                ]
+                login_state = {r["_id"]: r for r in await db.server_events.aggregate(login_pipe).to_list(10000)}
+
+                # 3. Enrich with live SCUM.db stats (squad tags)
+                db_stats: Dict[str, Dict[str, Any]] = {}
+                if s.get("folder_path"):
+                    try:
+                        db_stats = await asyncio.to_thread(scum_db.read_player_stats, s["folder_path"])
+                    except Exception:
+                        pass
+
+                # 4. Check online status
+                for r in rows:
+                    sid = r["_id"]
+                    ls = login_state.get(sid) or {}
+                    last_login_action = ls.get("last_login_action") or ""
+                    last_login_ts = ls.get("last_login_ts")
+
+                    is_online = last_login_action in ("logged_in", "connected")
+                    if is_online and last_login_ts:
+                        try:
+                            last_login_dt = datetime.fromisoformat(last_login_ts)
+                            age_h = (now_dt - last_login_dt).total_seconds() / 3600
+                            if age_h > STALE_LOGIN_HOURS:
+                                is_online = False
+                            
+                            started_at_str = s.get("started_at")
+                            if is_online and started_at_str:
+                                started_at_dt = datetime.fromisoformat(started_at_str)
+                                if last_login_dt < started_at_dt:
+                                    is_online = False
+                        except Exception:
+                            pass
+
+                    if is_online:
+                        db_row = db_stats.get(sid) or {}
+                        duration_s = 0
+                        if last_login_ts:
+                            try:
+                                duration_s = int((now_dt - datetime.fromisoformat(last_login_ts)).total_seconds())
+                            except Exception:
+                                pass
+                        
+                        players.append({
+                            "name": db_row.get("db_name") or r.get("last_name") or sid,
+                            "duration_s": duration_s,
+                            "squad": db_row.get("squad_name"),
+                        })
+            except Exception as ex:
+                logger.info("Failed to compile online players list for Discord status cache: %s", ex)
+                players = []
+
+        uptime_s = int(metrics.get("online_uptime_seconds") or 0)
+        new_cache[s["id"]] = {
+            "id": s["id"],
+            "name": s.get("name"),
+            "folder_name": s.get("folder_name"),
+            "status": s.get("status"),
+            "ready": bool(metrics.get("ready")),
+            "max_players": max_p,
+            "players": players,
+            "uptime_s": uptime_s,
+            "game_port": s.get("game_port"),
+            "query_port": query_port,
+            "snapshot_ts": now_ts,
+        }
+        # Push the per-server totals snapshot into the bot (for the UI's
+        # "X/X servers · Y players" badge).
+        try:
+            scum_discord.update_totals(
+                s["id"],
+                player_count=len(players),
+                running=bool(metrics.get("ready")),
+            )
+        except Exception:
+            pass
+
+    _discord_state_cache.clear()
+    _discord_state_cache.update(new_cache)
+
+
+def _bot_cfg_response(server_id: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Public-safe view of a per-server Discord bot config (token masked)."""
+    tok = cfg.get("token") or ""
+    return {
+        "enabled": bool(cfg.get("enabled")),
+        "token_set": bool(tok),
+        "token_preview": (tok[:6] + "…" + tok[-4:]) if len(tok) > 12 else "",
+        "status_guild_id": cfg.get("status_guild_id") or "",
+        "status_channel_id": cfg.get("status_channel_id") or "",
+        "event_channels": cfg.get("event_channels") or {},
+        "embed_title": cfg.get("embed_title") or "",
+        "embed_color": cfg.get("embed_color") or "",
+        "embed_image": cfg.get("embed_image") or "",
+        "embed_footer": cfg.get("embed_footer") or "",
+        "hide_player_names": bool(cfg.get("hide_player_names")),
+        "status": scum_discord.get_status(server_id),
+    }
+
+
+@api_router.get("/servers/{server_id}/discord/bot")
+async def get_server_discord_bot(server_id: str):
+    """Return THIS server's bot config. Token never leaves the server."""
+    srv = await db.servers.find_one({"id": server_id}, {"_id": 0, "discord_bot": 1})
+    if srv is None:
+        raise HTTPException(404, "Server not found")
+    return _bot_cfg_response(server_id, srv.get("discord_bot") or {})
+
+
+@api_router.put("/servers/{server_id}/discord/bot")
+async def update_server_discord_bot(server_id: str, payload: DiscordBotConfig):
+    """Persist this server's bot config and start/stop its bot accordingly."""
+    srv = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if srv is None:
+        raise HTTPException(404, "Server not found")
+    cfg = {**(srv.get("discord_bot") or {})}
+    data = payload.model_dump(exclude_none=True)
+    if "token" in data:
+        cfg["token"] = (data["token"] or "").strip()
+    if "enabled" in data:
+        cfg["enabled"] = bool(data["enabled"])
+    if "status_guild_id" in data:
+        cfg["status_guild_id"] = (data["status_guild_id"] or "").strip()
+    if "status_channel_id" in data:
+        new_ch = (data["status_channel_id"] or "").strip()
+        if new_ch != (cfg.get("status_channel_id") or ""):
+            # Channel changed → drop the stored message id so the bot
+            # posts a fresh embed in the new channel instead of trying to
+            # edit a message that lives elsewhere.
+            cfg["status_message_id"] = None
+        cfg["status_channel_id"] = new_ch
+    if "event_channels" in data:
+        cfg["event_channels"] = data["event_channels"] or {}
+    if "embed_title" in data:
+        cfg["embed_title"] = data["embed_title"]
+    if "embed_color" in data:
+        cfg["embed_color"] = data["embed_color"]
+    if "embed_image" in data:
+        cfg["embed_image"] = data["embed_image"]
+    if "embed_footer" in data:
+        cfg["embed_footer"] = data["embed_footer"]
+    if "hide_player_names" in data:
+        cfg["hide_player_names"] = bool(data["hide_player_names"])
+
+    await db.servers.update_one(
+        {"id": server_id}, {"$set": {"discord_bot": cfg}}
+    )
+
+    if cfg.get("enabled") and cfg.get("token"):
+        # Idempotent — restarts the bot only if the token actually changed
+        # (start_bot returns the running status and re-applies live settings
+        # for channels/event maps without a reconnect).
+        was_running = scum_discord.is_running(server_id)
+        if was_running:
+            # If the token is being changed, force-restart. Otherwise keep
+            # the connection alive and just push the new settings down.
+            if data.get("token") and (data["token"] or "").strip() != "":
+                await scum_discord.stop_bot(server_id)
+        await scum_discord.start_bot(
+            server_id,
+            cfg["token"],
+            _make_discord_state_fn(server_id),
+            status_channel_id=cfg.get("status_channel_id") or None,
+            message_id_store=_make_discord_msg_id_store(server_id),
+            initial_message_id=cfg.get("status_message_id") or None,
+            event_channels=cfg.get("event_channels") or {},
+            server_name=srv.get("name") or "",
+            embed_title=cfg.get("embed_title") or None,
+            embed_color=cfg.get("embed_color") or None,
+            embed_image=cfg.get("embed_image") or None,
+            embed_footer=cfg.get("embed_footer") or None,
+            hide_player_names=bool(cfg.get("hide_player_names")),
+        )
+    else:
+        await scum_discord.stop_bot(server_id)
+
+    return await get_server_discord_bot(server_id)
+
+
+@api_router.get("/servers/{server_id}/discord/bot/status")
+async def get_server_discord_bot_status(server_id: str):
+    return scum_discord.get_status(server_id)
+
+
+
+
+
+@api_router.post("/servers/{server_id}/logs/scan")
+async def scan_server_logs(server_id: str, limit: int = 20):
+    """Walk {folder_path}/SCUM/Saved/SaveFiles/Logs/ and parse the `limit` most recent files.
+
+    This is the "real server" path: when a SCUM server is actually writing logs on the
+    host, calling this endpoint ingests everything new. Deduplication is by event id so
+    re-scans are safe. Works on both Windows (backend bundled into Electron) and
+    Linux/macOS (dev preview) — `pathlib.Path` handles both separator styles natively.
+    """
+    srv = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not srv:
+        raise HTTPException(status_code=404, detail="Server not found")
+    folder = srv["folder_path"]
+    logs_dir = Path(folder) / "SCUM" / "Saved" / "SaveFiles" / "Logs"
+    if not logs_dir.exists():
+        return {"error": f"Logs directory not found: {logs_dir}", "scanned": 0}
+    files = sorted(logs_dir.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)[:limit]
+    total_parsed = 0
+    total_stored = 0
+    total_forwarded = 0
+    per_file: List[Dict[str, Any]] = []
+    for p in files:
+        try:
+            text = read_log_file(p)
+            lt = detect_log_type(p.name)
+            evs = parse_log_text(text, lt, filename=p.name, server_id=server_id)
+            r = await _store_events_and_forward(server_id, evs)
+            total_parsed += len(evs)
+            total_stored += r["stored"]
+            total_forwarded += r["forwarded"]
+            per_file.append({"file": p.name, "type": lt, "parsed": len(evs), **r})
+        except Exception as e:
+            per_file.append({"file": p.name, "error": str(e)})
+    return {"scanned": len(files), "parsed": total_parsed, "stored": total_stored, "forwarded": total_forwarded, "files": per_file}
+
+
+@api_router.get("/servers/{server_id}/events")
+async def list_server_events(
+    server_id: str,
+    type: Optional[str] = None,
+    player: Optional[str] = None,
+    limit: int = 200,
+    since: Optional[str] = None,
+):
+    q: Dict[str, Any] = {"server_id": server_id}
+    if type:
+        if type == "raid":
+            # Group all base raiding and lockpicking logs into 'raid'
+            q["type"] = {"$in": ["raid", "lockpicking", "destruction", "mine_trigger", "chest_ownership", "armor_absorption"]}
+        elif type == "economy":
+            # Group cash trade, bank transactions and conversions into 'economy'
+            q["type"] = {"$in": ["economy", "bank", "currency_conversion"]}
+        else:
+            q["type"] = type
+    if player:
+        q["$or"] = [{"player_name": {"$regex": player, "$options": "i"}}, {"steam_id": player}]
+    if since:
+        q["ts"] = {"$gt": since}
+    limit = max(1, min(int(limit or 200), 1000))
+    cur = db.server_events.find(q, {"_id": 0}).sort("ts", -1).limit(limit)
+    events = await cur.to_list(limit)
+    return {"server_id": server_id, "count": len(events), "events": events}
+
+
+@api_router.get("/servers/{server_id}/events/stats")
+async def server_event_stats(server_id: str, days: int = 0):
+    """Aggregate counts per type. `days=0` (default) means all time."""
+    match: Dict[str, Any] = {"server_id": server_id}
+    if days and days > 0:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        match["ts"] = {"$gt": cutoff}
+    pipeline = [
+        {"$match": match},
+        {"$group": {"_id": "$type", "count": {"$sum": 1}}},
+    ]
+    rows = await db.server_events.aggregate(pipeline).to_list(100)
+    by_type = {r["_id"]: r["count"] for r in rows}
+    
+    # ── Sum up sub-types into parent UI categories ────────────────────────
+    by_type["raid"] = (
+        by_type.get("raid", 0) +
+        by_type.get("lockpicking", 0) +
+        by_type.get("destruction", 0) +
+        by_type.get("mine_trigger", 0) +
+        by_type.get("chest_ownership", 0) +
+        by_type.get("armor_absorption", 0)
+    )
+    by_type["economy"] = (
+        by_type.get("economy", 0) +
+        by_type.get("bank", 0) +
+        by_type.get("currency_conversion", 0)
+    )
+
+    for t in LOG_TYPE_ORDER:
+        by_type.setdefault(t, 0)
+    top_pipe = [
+        {"$match": {**match, "player_name": {"$nin": [None, ""]}}},
+        {"$group": {"_id": "$player_name", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+        {"$limit": 5},
+    ]
+    top_players = await db.server_events.aggregate(top_pipe).to_list(5)
+    total = sum(by_type.values())
+    return {"server_id": server_id, "total": total, "by_type": by_type, "top_players": [{"name": r["_id"], "count": r["count"]} for r in top_players]}
+
+
+@api_router.delete("/servers/{server_id}/events")
+async def clear_server_events(server_id: str):
+    res = await db.server_events.delete_many({"server_id": server_id})
+    await db.server_players.delete_many({"server_id": server_id})
+    return {"deleted": res.deleted_count}
+
+
+# v1.0.37k — Players registry endpoints moved to routes/players.py (was ~258 lines).
+
+@api_router.get("/servers/{server_id}/discord", response_model=DiscordWebhookConfig)
+async def get_discord_webhooks(server_id: str):
+    srv = await db.servers.find_one({"id": server_id}, {"_id": 0}) or {}
+    hooks = srv.get("discord_webhooks") or {}
+    return DiscordWebhookConfig(**hooks)
+
+
+@api_router.put("/servers/{server_id}/discord", response_model=DiscordWebhookConfig)
+async def set_discord_webhooks(server_id: str, payload: DiscordWebhookConfig):
+    data = payload.model_dump()
+    await db.servers.update_one({"id": server_id}, {"$set": {"discord_webhooks": data}})
+    return DiscordWebhookConfig(**data)
+
+
+class DiscordTestPayload(BaseModel):
+    event_type: str = "admin"
+    webhook_url: str
+
+
+@api_router.post("/servers/{server_id}/discord/test")
+async def test_discord_webhook(server_id: str, payload: DiscordTestPayload):
+    fake = {
+        "type": payload.event_type,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "server_id": server_id,
+        "source_file": "manual-test",
+        "player_name": "LGSS Manager",
+        "command": "test",
+        "args": "This is a test notification from LGSS Manager.",
+        "message": "Hello from the manager!",
+        "action": "logged_in",
+        "killer_name": "TestKiller", "victim_name": "TestVictim", "weapon": "M9", "distance_m": 42.0,
+        "item_code": "Improvised_Metal_Chest", "quantity": 1, "amount": 1320, "trader": "A_0_Trader",
+        "description": "Suspicious teleport pattern",
+        "delta": 50,
+        "raw": "Manual test event",
+    }
+    sent = await _forward_to_discord(server_id, {payload.event_type: payload.webhook_url}, [fake])
+    return {"sent": sent}
+
+
+def _plan_config_files(settings: Dict[str, Any], folder_path: str) -> tuple[str, List[Dict[str, str]]]:
+    """Return (config_dir, files) where files = [{path, content}, ...].
+    Uses the correct path separator for the host OS so the plan is usable both
+    for Electron IPC (Windows) and direct backend writes."""
+    sep = "\\" if ("\\" in folder_path or (len(folder_path) >= 2 and folder_path[1] == ":")) else "/"
+    config_dir = f"{folder_path}{sep}SCUM{sep}Saved{sep}Config{sep}WindowsServer"
+    files = [
+        {"path": f"{config_dir}{sep}ServerSettings.ini", "content": render_server_settings_ini(settings)},
+        # AdminUsers.ini: SCUM requires the [godmode] flag to grant in-game
+        # admin privileges. Manager always appends it so admins can't forget
+        # and end up with toothless entries.
+        {"path": f"{config_dir}{sep}AdminUsers.ini", "content": render_user_list(settings.get("users_admins", []), force_flag="godmode")},
+        # All other SCUM user files take ONLY a bare 17-digit steam_id per
+        # line; any `[flag]` bracket will make SCUM skip the entry on parse.
+        # Force-strip flags so an old DB row with leftover brackets doesn't
+        # leak into the file.
+        {"path": f"{config_dir}{sep}ServerSettingsAdminUsers.ini", "content": render_user_list(settings.get("users_server_admins", []), force_flag="")},
+        {"path": f"{config_dir}{sep}BannedUsers.ini", "content": render_user_list(settings.get("users_banned", []), force_flag="")},
+        {"path": f"{config_dir}{sep}WhitelistedUsers.ini", "content": render_user_list(settings.get("users_whitelisted", []), force_flag="")},
+        {"path": f"{config_dir}{sep}ExclusiveUsers.ini", "content": render_user_list(settings.get("users_exclusive", []), force_flag="")},
+        {"path": f"{config_dir}{sep}SilencedUsers.ini", "content": render_user_list(settings.get("users_silenced", []), force_flag="")},
+        {"path": f"{config_dir}{sep}EconomyOverride.json", "content": render_economy_json(settings)},
+        {"path": f"{config_dir}{sep}RaidTimes.json", "content": render_raid_times_json(settings)},
+        {"path": f"{config_dir}{sep}Notifications.json", "content": render_notifications_json(settings)},
+        {"path": f"{config_dir}{sep}Input.ini", "content": render_input_ini(settings)},
+        {"path": f"{config_dir}{sep}GameUserSettings.ini", "content": render_gameusersettings_ini(settings)},
+    ]
+    return config_dir, files
+
+
+def _write_config_files_for_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """Write rendered SCUM config files directly to disk for the given server doc.
+    Works on both Windows (backend bundled into Electron) and Linux/macOS (dev).
+    Returns {written_count, written, errors, config_dir}."""
+    settings = doc.get("settings", {}) or {}
+    folder = doc["folder_path"]
+    config_dir, files = _plan_config_files(settings, folder)
+    written: List[str] = []
+    errors: List[Dict[str, str]] = []
+    try:
+        Path(config_dir).mkdir(parents=True, exist_ok=True)
+        for f in files:
+            try:
+                p = Path(f["path"])
+                p.write_text(f["content"], encoding="utf-8")
+                written.append(str(p))
+            except Exception as e:
+                errors.append({"path": f["path"], "error": str(e)})
+    except Exception as e:
+        errors.append({"path": config_dir, "error": str(e)})
+    return {
+        "config_dir": config_dir,
+        "files": files,
+        "count": len(files),
+        "written_count": len(written),
+        "written": written,
+        "errors": errors,
+        "wrote_to_disk": bool(written),
+    }
+
+
+@api_router.post("/servers/{server_id}/save-config")
+async def save_server_config(server_id: str, write_to_disk: bool = True):
+    """Render all manager settings into actual SCUM config files and write them to disk.
+
+    Target directory: {folder_path}/SCUM/Saved/Config/WindowsServer/
+
+    The backend writes files directly on whichever OS it runs on. When shipped
+    inside the Electron app (PyInstaller bundle on Windows) this produces the
+    real files SCUM reads. In Electron desktop the shell can also receive the
+    same plan via `window.lgss.writeConfigFiles` for cross-process verification.
+    """
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Server not found")
+    settings = doc.get("settings", {}) or {}
+    folder = doc["folder_path"]
+    config_dir, files = _plan_config_files(settings, folder)
+
+    if not write_to_disk:
+        return {
+            "config_dir": config_dir,
+            "files": files,
+            "count": len(files),
+            "written_count": 0,
+            "written": [],
+            "errors": [],
+            "wrote_to_disk": False,
+        }
+
+    res = _write_config_files_for_doc(doc)
+    return res
+
+
+@api_router.post("/servers/{server_id}/first-boot", response_model=ServerProfile)
+async def first_boot_server(server_id: str, timeout_sec: int = 120):
+    """Run SCUMServer.exe once for a few seconds so the game generates its
+    default `Saved/Config/WindowsServer/*.ini` files, then stop it and parse
+    those real files back into the manager's settings.
+
+    Called automatically by the frontend after a successful SteamCMD install.
+    Safe to call manually afterwards (re-parses whatever is on disk).
+
+    On non-Windows hosts this is a no-op (SCUMServer.exe is Windows-only) but
+    we still parse any existing config files that may have been placed manually.
+    """
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Server not found")
+    if not doc.get("installed"):
+        raise HTTPException(status_code=400, detail="Server not installed yet")
+
+    folder = doc["folder_path"]
+    port = int(doc.get("game_port") or 7777)
+    query_port = int(doc.get("query_port") or 7778)
+    max_players = int(doc.get("max_players") or 64)
+
+    # Actually boot SCUMServer.exe so it produces its config files.
+    # Runs the blocking scum_proc.first_boot in a thread so we don't stall the
+    # FastAPI event loop for 60+ seconds.
+    def _run_boot() -> Dict[str, Any]:
+        return scum_proc.first_boot(
+            server_id=server_id,
+            folder_path=folder,
+            port=port,
+            query_port=query_port,
+            max_players=max_players,
+            timeout_sec=timeout_sec,
+        )
+    try:
+        boot_result = await asyncio.to_thread(_run_boot)
+    except Exception as e:
+        logger.exception("first_boot failed")
+        raise HTTPException(status_code=500, detail=f"first_boot failed: {e}")
+
+    # Parse whatever config files now exist (partial is OK; missing sections fall back to defaults).
+    parsed = parse_real_config_dir(folder)
+    # Merge parsed REAL values over the current settings; keep manager-only keys
+    # like `notifications`, `custom_ini`, and `economy_traders` if the game didn't
+    # produce them. SCUM never writes Notifications.json itself — preserve ours.
+    current = {**(doc.get("settings") or {})}
+    merged = {**current}
+    for k, v in parsed.items():
+        # Never overwrite manager-authored list/dict categories with empty parsed data
+        if isinstance(v, (list, dict)) and not v:
+            continue
+        merged[k] = v
+    # Explicitly keep manager-managed fields if parse produced blanks
+    if not parsed.get("notifications"):
+        merged["notifications"] = current.get("notifications", [])
+    if not parsed.get("custom_ini"):
+        merged["custom_ini"] = current.get("custom_ini", {
+            "ExtraServerSettings": "", "ExtraGameSettings": "", "ExtraEngineSettings": "",
+        })
+
+    await db.servers.update_one({"id": server_id}, {"$set": {"settings": merged, "status": "Stopped"}})
+    doc["settings"] = merged
+    doc["status"] = "Stopped"
+
+    # Persist anything we have back to disk so next boot reflects what the user sees.
+    try:
+        _write_config_files_for_doc(doc)
+    except Exception:
+        logger.exception("first_boot: post-parse write failed (non-fatal)")
+
+    # Attach boot telemetry to the response via a side-channel (saved under meta).
+    # (ServerProfile does not include these fields, but the frontend polls /first-boot for the raw result.)
+    REGISTRY_KEY = f"lgss-first-boot-{server_id}"
+    await db.app_meta.update_one(
+        {"_id": REGISTRY_KEY},
+        {"$set": {**boot_result, "at": datetime.now(timezone.utc).isoformat()}},
+        upsert=True,
+    )
+    return ServerProfile(**doc)
+
+
+@api_router.get("/servers/{server_id}/first-boot/result")
+async def first_boot_result(server_id: str):
+    """Returns the most recent `first-boot` outcome for this server."""
+    doc = await db.app_meta.find_one({"_id": f"lgss-first-boot-{server_id}"}, {"_id": 0})
+    return doc or {"ok": False, "files_found": [], "error": "never_run"}
+
+
+# ---------- MANAGER VERSION / SELF-UPDATE ----------
+CURRENT_MANAGER_VERSION = "1.1.15"
+LATEST_MANAGER_VERSION_KEY = "manager-latest-version"
+
+
+@api_router.get("/app/version")
+async def get_app_version():
+    doc = await db.app_meta.find_one({"_id": LATEST_MANAGER_VERSION_KEY}, {"_id": 0})
+    latest = (doc or {}).get("version", CURRENT_MANAGER_VERSION)
+    return {
+        "current": CURRENT_MANAGER_VERSION,
+        "latest": latest,
+        "update_available": latest != CURRENT_MANAGER_VERSION,
+        "notes": (doc or {}).get("notes", ""),
+    }
+
+
+class ManagerReleasePublish(BaseModel):
+    version: str
+    notes: Optional[str] = ""
+
+
+@api_router.post("/app/release")
+async def publish_manager_release(payload: ManagerReleasePublish):
+    """Admin-only endpoint used by the main agent to push a new manager release.
+    Users' UI shows a pulsing 'Manager Update' button whenever latest != current."""
+    await db.app_meta.update_one(
+        {"_id": LATEST_MANAGER_VERSION_KEY},
+        {"$set": {"version": payload.version, "notes": payload.notes, "published_at": datetime.now(timezone.utc).isoformat()}},
+        upsert=True,
+    )
+    return {"ok": True, "latest": payload.version}
+
+
+@api_router.post("/app/apply-update")
+async def apply_manager_update():
+    """In web preview this simply acknowledges the update. In Electron the shell triggers
+    auto-updater + relaunch. Here we just bump the local 'current' record."""
+    return {"ok": True, "message": "Update acknowledged. In desktop build Electron will download and relaunch."}
+
+
+# ---------- SCUM FILE EXPORT / IMPORT ----------
+EXPORT_MAP = {
+    # AdminUsers.ini always carries the `[godmode]` bracket so SCUM grants
+    # admin privileges; all other user files are stripped to bare steam_id
+    # per line (SCUM rejects flags on those files).
+    "admins": ("AdminUsers.ini", lambda s: render_user_list(s.get("users_admins", []), force_flag="godmode")),
+    "server_admins": ("ServerSettingsAdminUsers.ini", lambda s: render_user_list(s.get("users_server_admins", []), force_flag="")),
+    "banned": ("BannedUsers.ini", lambda s: render_user_list(s.get("users_banned", []), force_flag="")),
+    "exclusive": ("ExclusiveUsers.ini", lambda s: render_user_list(s.get("users_exclusive", []), force_flag="")),
+    "whitelisted": ("WhitelistedUsers.ini", lambda s: render_user_list(s.get("users_whitelisted", []), force_flag="")),
+    "silenced": ("SilencedUsers.ini", lambda s: render_user_list(s.get("users_silenced", []), force_flag="")),
+    "economy": ("EconomyOverride.json", lambda s: render_economy_json(s)),
+    "gameusersettings": ("GameUserSettings.ini", lambda s: render_gameusersettings_ini(s)),
+    "server_settings": ("ServerSettings.ini", lambda s: render_server_settings_ini(s)),
+    "raid_times": ("RaidTimes.json", lambda s: render_raid_times_json(s)),
+    "notifications": ("Notifications.json", lambda s: render_notifications_json(s)),
+    "input": ("Input.ini", lambda s: render_input_ini(s)),
+}
+
+
+USER_LIST_IMPORT_MAP = {
+    "admins": "users_admins",
+    "server_admins": "users_server_admins",
+    "banned": "users_banned",
+    "exclusive": "users_exclusive",
+    "whitelisted": "users_whitelisted",
+    "silenced": "users_silenced",
+}
+
+
+@api_router.get("/servers/{server_id}/export/{file_key}")
+async def export_server_file(server_id: str, file_key: str):
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Server not found")
+    if file_key not in EXPORT_MAP:
+        raise HTTPException(status_code=400, detail="Unknown file_key")
+    filename, renderer = EXPORT_MAP[file_key]
+    settings = doc.get("settings", {})
+    return {"filename": filename, "content": renderer(settings)}
+
+
+@api_router.post("/servers/{server_id}/import/{file_key}")
+async def import_server_file(server_id: str, file_key: str, payload: Dict[str, Any]):
+    """Import a raw file content string and merge into server settings."""
+    text = payload.get("content", "")
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Server not found")
+    try:
+        settings = _apply_file_to_settings(doc.get("settings", {}), file_key, text)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    await db.servers.update_one({"id": server_id}, {"$set": {"settings": settings}})
+    doc["settings"] = settings
+    return ServerProfile(**doc)
+
+
+def _apply_file_to_settings(current: Dict[str, Any], file_key: str, text: str) -> Dict[str, Any]:
+    """Pure function: take current settings + file key + raw text, return updated settings.
+    Raises ValueError if the file cannot be parsed. Used by both single-file and bulk import."""
+    settings = {**current}
+    if file_key in USER_LIST_IMPORT_MAP:
+        settings[USER_LIST_IMPORT_MAP[file_key]] = parse_user_list_text(text)
+    elif file_key == "economy":
+        try:
+            data = json_lib.loads(text)
+        except json_lib.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON: {e}") from e
+        overrides = data.get("economy-override", data)
+        settings["economy_override"] = {k: v for k, v in overrides.items() if not isinstance(v, (dict, list))}
+        traders = overrides.get("traders")
+        if isinstance(traders, dict):
+            settings["economy_traders"] = traders
+    elif file_key == "gameusersettings":
+        # Cross-platform temp file — `Path("/tmp/...")` resolves to "\tmp\..."
+        # on Windows (drive root, not %TEMP%), so the write fails with
+        # "[Errno 2] No such file or directory". Use tempfile instead.
+        import tempfile as _tempfile
+        with _tempfile.NamedTemporaryFile(suffix="_gus.ini", delete=False, mode="w", encoding="utf-8") as tf:
+            tf.write(text)
+            tmp_path = Path(tf.name)
+        try:
+            sects = parse_ini_sections(tmp_path)
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        if not sects:
+            raise ValueError("No [Section] headers found — not a valid GameUserSettings.ini")
+        for sect, dest in (("Game", "client_game"), ("Mouse", "client_mouse"), ("Video", "client_video"), ("Graphics", "client_graphics"), ("Sound", "client_sound")):
+            if sect in sects:
+                settings[dest] = sects[sect]
+    elif file_key == "server_settings":
+        import tempfile as _tempfile
+        with _tempfile.NamedTemporaryFile(suffix="_ss.ini", delete=False, mode="w", encoding="utf-8") as tf:
+            tf.write(text)
+            tmp_path = Path(tf.name)
+        try:
+            sects = parse_ini_sections(tmp_path)
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        if not sects:
+            raise ValueError("No [Section] headers found — not a valid ServerSettings.ini")
+        if "General" not in sects:
+            raise ValueError("Missing [General] section — does not look like a SCUM ServerSettings.ini")
+        for sect, dest in (("General", "srv_general"), ("World", "srv_world"), ("Respawn", "srv_respawn"), ("Vehicles", "srv_vehicles"), ("Damage", "srv_damage"), ("Features", "srv_features")):
+            if sect in sects:
+                settings[dest] = sects[sect]
+    elif file_key == "raid_times":
+        try:
+            data = json_lib.loads(text)
+        except json_lib.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON: {e}") from e
+        settings["raid_times"] = data.get("raiding-times", [])
+    elif file_key == "notifications":
+        try:
+            data = json_lib.loads(text)
+        except json_lib.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON: {e}") from e
+        settings["notifications"] = data.get("Notifications", [])
+    elif file_key == "input":
+        import tempfile as _tempfile
+        with _tempfile.NamedTemporaryFile(suffix="_in.ini", delete=False, mode="w", encoding="utf-8") as tf:
+            tf.write(text)
+            tmp_path = Path(tf.name)
+        try:
+            parsed = parse_input_ini(tmp_path)
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        settings["input_axis"] = parsed["AxisMappings"]
+        settings["input_action"] = parsed["ActionMappings"]
+    else:
+        raise ValueError(f"Unknown file_key: {file_key}")
+    return settings
+
+
+IMPORT_FILE_KEYS = [
+    "server_settings", "gameusersettings", "economy", "raid_times",
+    "notifications", "input", "admins", "server_admins",
+    "banned", "whitelisted", "exclusive", "silenced",
+]
+
+
+@api_router.post("/servers/{server_id}/import-bulk")
+async def import_server_files_bulk(
+    server_id: str,
+    files: List[UploadFile] = File(...),
+    file_keys: str = Form(...),  # comma-separated keys parallel to files
+):
+    """Import multiple SCUM config files at once. Files not uploaded keep their current values.
+
+    `file_keys` is a comma-separated list of IMPORT_FILE_KEYS in the same order as `files`.
+    Returns per-file result: { imported, errored, results: [{file_key, filename, ok, error}] }.
+    """
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Server not found")
+    keys = [k.strip() for k in (file_keys or "").split(",") if k.strip()]
+    if len(keys) != len(files):
+        raise HTTPException(status_code=400, detail=f"file_keys count ({len(keys)}) must equal files count ({len(files)})")
+
+    settings = {**doc.get("settings", {})}
+    results: List[Dict[str, Any]] = []
+    imported = 0
+    errored = 0
+    for fk, up in zip(keys, files):
+        try:
+            raw = await up.read()
+            # Try UTF-8 first, fall back to UTF-16 (SCUM's own logs use this)
+            try:
+                text = raw.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                text = raw.decode("utf-16", errors="replace")
+            if fk not in IMPORT_FILE_KEYS:
+                raise ValueError(f"Unsupported file_key '{fk}'")
+            settings = _apply_file_to_settings(settings, fk, text)
+            results.append({"file_key": fk, "filename": up.filename, "ok": True, "error": None})
+            imported += 1
+        except Exception as e:
+            results.append({"file_key": fk, "filename": up.filename, "ok": False, "error": str(e)})
+            errored += 1
+
+    if imported:
+        await db.servers.update_one({"id": server_id}, {"$set": {"settings": settings}})
+        doc["settings"] = settings
+    return {
+        "server_id": server_id,
+        "imported": imported,
+        "errored": errored,
+        "results": results,
+        "server": ServerProfile(**doc).model_dump(),
+    }
+
+
+# ---------- RESTART / BULK POWER ACTIONS ----------
+@api_router.post("/servers/{server_id}/restart", response_model=ServerProfile)
+async def restart_server(server_id: str):
+    """Real Stop → Backup → Start cycle for SCUMServer.exe.
+
+    1. Take a pre-stop backup of SaveFiles (best-effort, non-blocking on failure).
+    2. Mark expected stop so crash detector skips.
+    3. Kill the real EXE via scum_proc.stop_server.
+    4. Brief settle.
+    5. Re-spawn via _do_start_internal (handles crash-recovery restore too).
+    """
+    doc = await db.servers.find_one({"id": server_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Server not found")
+    if not doc.get("installed"):
+        raise HTTPException(status_code=400, detail="Server not installed")
+
+    await db.servers.update_one({"id": server_id}, {"$set": {"status": "Updating"}})
+    await _do_stop_internal(server_id, take_backup=True)
+    await asyncio.sleep(1.5)  # let ports & file locks release
+    fresh = await db.servers.find_one({"id": server_id}, {"_id": 0}) or doc
+    await _do_start_internal(server_id, fresh)
+    fresh = await db.servers.find_one({"id": server_id}, {"_id": 0}) or doc
+    return ServerProfile(**fresh)
+
+
+@api_router.post("/servers/bulk/stop-all")
+async def stop_all_servers():
+    servers = await db.servers.find({"installed": True, "status": "Running"}, {"_id": 0}).to_list(500)
+    for s in servers:
+        await _do_stop_internal(s["id"], take_backup=True)
+    return {"stopped": len(servers)}
+
+
+@api_router.post("/servers/bulk/restart-all")
+async def restart_all_servers():
+    servers = await db.servers.find({"installed": True}, {"_id": 0}).to_list(500)
+    affected = 0
+    for s in servers:
+        if s.get("status") == "Running":
+            await db.servers.update_one({"id": s["id"]}, {"$set": {"status": "Updating"}})
+            await _do_stop_internal(s["id"], take_backup=True)
+            await asyncio.sleep(1.5)
+            fresh = await db.servers.find_one({"id": s["id"]}, {"_id": 0}) or s
+            try:
+                await _do_start_internal(s["id"], fresh)
+            except HTTPException as e:
+                logger.warning("restart-all start failed for %s: %s", s.get("name"), e.detail)
+            affected += 1
+        elif s.get("status") == "Stopped":
+            fresh = await db.servers.find_one({"id": s["id"]}, {"_id": 0}) or s
+            try:
+                await _do_start_internal(s["id"], fresh)
+                affected += 1
+            except HTTPException as e:
+                logger.warning("restart-all start failed for %s: %s", s.get("name"), e.detail)
+    return {"restarted": affected}
+
+
+# v1.0.37k — /settings/schema moved to routes/schema.py (was ~252 lines).
+# v1.0.37k — Mount the modular route files. Each module under `routes/`
+# exposes its own `router: APIRouter` keyed at `/api/...` once we attach it
+# via `include_router(prefix="/api")`. Importing here (rather than at top)
+# keeps the side-effect ordering predictable: app_state/db init must happen
+# BEFORE any route module references `db`.
+from routes import schema as _schema_routes  # noqa: E402
+from routes import players as _players_routes  # noqa: E402
+from routes import diagnostics as _diag_routes  # noqa: E402
+from routes import remote_servers as _remote_routes  # noqa: E402
+api_router.include_router(_schema_routes.router)
+api_router.include_router(_players_routes.router)
+api_router.include_router(_diag_routes.router)
+api_router.include_router(_remote_routes.router)
+
+app.include_router(api_router)
+
+# CORS — careful here. The Starlette CORSMiddleware silently DROPS the
+# `Access-Control-Allow-Origin` response header when credentials=True is
+# combined with the wildcard "*" origin (per CORS spec). The user's
+# Electron/Chrome was getting "No 'Access-Control-Allow-Origin' header"
+# errors against http://127.0.0.1:8001 from http://localhost:3000 for
+# exactly this reason. Fix: when CORS_ORIGINS is unset or "*", switch to
+# `allow_origin_regex=".*"` which is spec-compliant with credentials=True.
+# Admins who want a strict allowlist set CORS_ORIGINS in .env (comma-list).
+_cors_raw = (os.environ.get('CORS_ORIGINS') or '*').strip()
+if _cors_raw in ('*', '') or '*' in _cors_raw:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_credentials=True,
+        allow_origin_regex=".*",      # accept every origin but echo it back
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_credentials=True,
+        allow_origins=[o.strip() for o in _cors_raw.split(',') if o.strip()],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+# ---- Global exception handler for MongoDB offline (v1.0.37c) ----
+# When the local MongoDB is offline (very common on dev machines that don't
+# auto-start mongod), every Motor call raises `ServerSelectionTimeoutError`
+# after `serverSelectionTimeoutMS=3000`. Default FastAPI converts that into
+# a bare 500 with NO CORS headers, so the browser shows "Network Error"
+# instead of the actual problem. We catch it here and return a clean 503
+# with the CORS middleware still in the response chain (FastAPI runs
+# middleware on exception-handler responses too).
+from fastapi import Request
+from fastapi.responses import JSONResponse
+try:
+    from pymongo.errors import ServerSelectionTimeoutError, ConnectionFailure, AutoReconnect, NetworkTimeout
+    _MONGO_OFFLINE_EXCS = (ServerSelectionTimeoutError, ConnectionFailure, AutoReconnect, NetworkTimeout)
+except ImportError:  # pragma: no cover — pymongo is always installed
+    _MONGO_OFFLINE_EXCS = tuple()
+
+
+@app.exception_handler(Exception)
+async def _global_exception_handler(request: Request, exc: Exception):
+    # CORS headers don't pass through Starlette's ServerErrorMiddleware
+    # (it sits outside the CORSMiddleware in the middleware stack). So when
+    # an unhandled exception bubbles up, the response we return here would
+    # otherwise be missing `Access-Control-Allow-Origin` — exactly the
+    # symptom the user reported in the screenshot. We attach the headers
+    # manually here, echoing back whatever Origin the request carried.
+    origin = request.headers.get("origin")
+    cors_headers = {}
+    if origin:
+        cors_headers["Access-Control-Allow-Origin"] = origin
+        cors_headers["Access-Control-Allow-Credentials"] = "true"
+        cors_headers["Vary"] = "Origin"
+
+    # Only intercept MongoDB-down errors here. Everything else falls through
+    # to FastAPI's default 500 handler so we don't accidentally hide real
+    # application bugs (KeyError, etc.) behind a 503.
+    if _MONGO_OFFLINE_EXCS and isinstance(exc, _MONGO_OFFLINE_EXCS):
+        return JSONResponse(
+            status_code=503,
+            headers=cors_headers,
+            content={
+                "detail": "MongoDB unreachable. Start the local mongod service "
+                          "(or the bundled portable MongoDB) and refresh.",
+                "error_class": exc.__class__.__name__,
+                "code": "MONGO_OFFLINE",
+            },
+        )
+    # Surface other exceptions normally; logger.exception preserves the
+    # traceback in the backend log so we can still debug without breaking
+    # the CORS contract on the wire.
+    logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        headers=cors_headers,
+        content={"detail": "Internal server error", "error_class": exc.__class__.__name__},
+    )
+
+# ── Backend logging setup ──────────────────────────────────────────────────
+# Use a compact, readable format.  Third-party libraries (uvicorn, httpx,
+# motor, pymongo) are noisy at DEBUG/INFO — cap them at WARNING so the
+# terminal only shows meaningful application events.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
+    datefmt="%H:%M:%S",
+)
+for _lib in ("uvicorn.access", "httpx", "httpcore", "motor", "pymongo", "asyncio"):
+    logging.getLogger(_lib).setLevel(logging.WARNING)
+
+logger = logging.getLogger("scum_manager")
+
+
+# ========== REAL BACKGROUND SCHEDULER ==========
+# Wakes every 30 seconds. For each server with automation.enabled:
+#   * If any restart_time (HH:MM) matches the current minute, queue a restart cycle
+#     (mark Updating -> Stopped -> Running to mimic the real stop/start sequence)
+#   * Runs an auto-update check every automation.update_check_interval_min minutes
+#   * If auto_update_enabled and a new build is detected while server is Stopped,
+#     trigger an update cycle (Updating -> Stopped with new build id)
+
+
+_startup_task: Optional[asyncio.Task] = None
+_scheduler_task: Optional[asyncio.Task] = None
+_fast_log_scanner_task: Optional[asyncio.Task] = None
+_last_restart_tick: Dict[str, str] = {}   # server_id -> "YYYY-MM-DDTHH:MM" of last restart
+_last_update_check_at: Dict[str, float] = {}  # server_id -> epoch seconds
+_last_config_reimport_at: Dict[str, float] = {}  # server_id -> epoch seconds
+_last_backup_at: Dict[str, float] = {}    # server_id -> epoch seconds
+_last_keep_running_start: Dict[str, float] = {}  # server_id -> epoch seconds
+_crash_watch: Dict[str, Dict[str, Any]] = {}  # server_id -> {"was_running": bool, "pid": int}
+_log_offsets: Dict[str, int] = {}  # filepath -> last read byte offset
+# Set of server_ids whose next Running→Stopped transition is an ADMIN-driven
+# stop (manual Stop / Restart / Update / scheduled restart). The scheduler's
+# crash detector consults this set and, if present, skips the "crash" backup
+# and does NOT set the crash_recovery_pending flag. The entry is popped after
+# the first stop transition is observed.
+_expected_stops: set = set()
+
+
+def mark_expected_stop(server_id: str) -> None:
+    """Record that the next Running→Stopped transition for this server is an
+    expected admin operation (not a crash). Safe to call multiple times."""
+    _expected_stops.add(server_id)
+
+
+_vehicle_ownership_snapshot: Dict[str, Dict[int, Dict[str, Any]]] = {}   # server_id -> {vid: {owner_sid, ...}}
+CONFIG_REIMPORT_INTERVAL_SEC = 60  # how often we re-read on-disk configs into DB
+ACTIVITY_SAMPLE_INTERVAL_SEC = 300  # 5-min granularity for the activity chart
+_last_activity_sample_at: Dict[str, float] = {}
+
+
+def _drop_inactive_server_keys(mapping: Dict[str, Any], active_ids: set) -> None:
+    for sid in list(mapping.keys()):
+        if sid not in active_ids:
+            mapping.pop(sid, None)
+
+
+def _path_under_any(path: Path, roots: List[Path]) -> bool:
+    try:
+        resolved = path.resolve()
+    except Exception:
+        resolved = path
+    for root in roots:
+        try:
+            resolved.relative_to(root)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _prune_runtime_state(servers: List[Dict[str, Any]]) -> None:
+    """Bound long-lived in-memory scheduler state to the active server set."""
+    active_ids = {s.get("id") for s in servers if s.get("id")}
+    for mapping in (
+        _last_restart_tick,
+        _last_update_check_at,
+        _last_config_reimport_at,
+        _last_backup_at,
+        _last_keep_running_start,
+        _crash_watch,
+        _vehicle_ownership_snapshot,
+        _last_activity_sample_at,
+        _discord_state_cache,
+    ):
+        _drop_inactive_server_keys(mapping, active_ids)
+    _expected_stops.intersection_update(active_ids)
+
+    active_log_roots: List[Path] = []
+    for s in servers:
+        folder_path = s.get("folder_path")
+        if folder_path:
+            active_log_roots.append(Path(folder_path) / "SCUM" / "Saved" / "SaveFiles" / "Logs")
+
+    for filepath in list(_log_offsets.keys()):
+        p = Path(filepath)
+        if not p.exists() or not _path_under_any(p, active_log_roots):
+            _log_offsets.pop(filepath, None)
+
+    overflow = len(_log_offsets) - 1000
+    if overflow > 0:
+        for filepath in list(_log_offsets.keys())[:overflow]:
+            _log_offsets.pop(filepath, None)
+
+
+def _clear_server_runtime_state(server_id: str, folder_path: Optional[str] = None) -> None:
+    for mapping in (
+        _last_restart_tick,
+        _last_update_check_at,
+        _last_config_reimport_at,
+        _last_backup_at,
+        _last_keep_running_start,
+        _crash_watch,
+        _vehicle_ownership_snapshot,
+        _last_activity_sample_at,
+        _discord_state_cache,
+    ):
+        mapping.pop(server_id, None)
+    _expected_stops.discard(server_id)
+    if folder_path:
+        log_root = Path(folder_path) / "SCUM" / "Saved" / "SaveFiles" / "Logs"
+        for filepath in list(_log_offsets.keys()):
+            if _path_under_any(Path(filepath), [log_root]):
+                _log_offsets.pop(filepath, None)
+    scum_proc.cleanup_server_state(server_id, folder_path)
+
+
+async def _auto_scan_logs(server_id: str, folder_path: str, limit: int = 20) -> Dict[str, int]:
+    """Background helper: parse the N most recent log files for this server and
+    forward new events to Discord. Safe to call repeatedly — events are de-duped
+    by their stable id. Runs the blocking filesystem walk in a worker thread so
+    we never stall the FastAPI event loop."""
+    logs_dir = Path(folder_path) / "SCUM" / "Saved" / "SaveFiles" / "Logs"
+    if not logs_dir.exists():
+        return {"scanned": 0, "stored": 0, "forwarded": 0}
+
+    def _collect() -> List[Dict[str, Any]]:
+        files = sorted(logs_dir.glob("*.log"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)[:limit]
+        all_events: List[Dict[str, Any]] = []
+        for p in files:
+            try:
+                filepath = str(p)
+                prev = _log_offsets.get(filepath, 0)
+                text, new_offset = get_new_log_text(p, prev)
+                if new_offset == prev:
+                    continue
+                _log_offsets[filepath] = new_offset
+                if not text:
+                    continue
+                lt = detect_log_type(p.name)
+                evs = parse_log_text(text, lt, filename=p.name, server_id=server_id)
+                all_events.extend(evs)
+            except Exception as e:
+                logger.info("auto-scan: %s parse failed: %s", p.name, e)
+        return all_events
+
+    events = await asyncio.to_thread(_collect)
+    if not events:
+        return {"scanned": 0, "stored": 0, "forwarded": 0}
+    res = await _store_events_and_forward(server_id, events)
+    return {"scanned": len(events), **res}
+
+
+async def _run_fast_log_scanner():
+    """Tails the active log files of starting or running servers every 2 seconds.
+    This guarantees real-time player status updates on the dashboard."""
+    while True:
+        try:
+            # Query active servers
+            servers = await db.servers.find(
+                {"installed": True, "status": {"$in": ["Running", "Starting"]}},
+                {"_id": 0, "id": 1, "folder_path": 1, "name": 1}
+            ).to_list(500)
+            for s in servers:
+                sid = s["id"]
+                folder_path = s.get("folder_path")
+                if not folder_path:
+                    continue
+                try:
+                    # Ticks every 2s, scan only the newest 5 log files for changes
+                    r = await _auto_scan_logs(sid, folder_path, limit=5)
+                    if r.get("stored"):
+                        logger.info(
+                            "Fast-scan: %s → %d new events",
+                            s.get("name") or sid, r["stored"]
+                        )
+                except Exception as e:
+                    logger.debug("Fast-scan failed for %s: %s", sid, e)
+        except Exception as e:
+            logger.debug("Fast-scan loop iteration failed: %s", e)
+        await asyncio.sleep(2.0)
+
+
+async def _tick_scheduler():
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            local_now = datetime.now()
+            # Auto-restart times are specified by the admin in LOCAL TIME via
+            # the UI. We compute hhmm in two places now:
+            #   1. Host local time          → used as the SAFE DEFAULT when a
+            #      server profile has no `automation.timezone` set.
+            #   2. per-server IANA timezone → used when admin has selected
+            #      a tz (e.g. "Europe/Istanbul"). This is critical for
+            #      multi-region deployments — a TR community on a US VPS
+            #      wants 22:00 Istanbul, not 22:00 UTC.
+            # The day_tag includes the resolved hhmm so two servers in
+            # different tzs can't accidentally share a debounce key.
+            host_hhmm = local_now.strftime("%H:%M")
+            host_day_tag = local_now.strftime("%Y-%m-%dT%H:%M")
+            servers = await db.servers.find({}, {"_id": 0}).to_list(500)
+            _prune_runtime_state(servers)
+
+            # Refresh the per-server Discord state cache so each bot's
+            # presence/embed reflects reality. Skip when no bots are running
+            # to avoid wasted A2S sweeps.
+            if scum_discord.get_all_statuses():
+                try:
+                    await _refresh_discord_state_cache()
+                except Exception as e:
+                    logger.info("discord cache refresh failed: %s", e)
+
+            for s in servers:
+                auto = s.get("automation") or {}
+                sid = s["id"]
+                # Resolve THIS server's effective wall-clock time. Falls back
+                # to the backend host's local time when no timezone is set.
+                srv_tz_name = (auto.get("timezone") or "").strip()
+                if srv_tz_name:
+                    try:
+                        from zoneinfo import ZoneInfo
+                        srv_now = now.astimezone(ZoneInfo(srv_tz_name))
+                        hhmm = srv_now.strftime("%H:%M")
+                        day_tag = srv_now.strftime("%Y-%m-%dT%H:%M")
+                    except Exception as e:
+                        # Bad/unknown tz name. Log once and fall back to UTC.
+                        logger.info("Server %s has invalid timezone %r — falling back to UTC. Err: %s",
+                                    s.get("name"), srv_tz_name, e)
+                        hhmm = host_hhmm
+                        day_tag = host_day_tag
+                else:
+                    hhmm = host_hhmm
+                    day_tag = host_day_tag
+                # --- Promote Starting → Running once SCUM is really up ---
+                # The /start endpoint sets status="Starting". The real
+                # transition (world loaded, A2S replying OR "Global Stats"
+                # ticking in SCUM.log) is detected by scum_proc.get_metrics()
+                # which sets the per-process `ready` flag — but nothing was
+                # flipping the DB status back, so the UI card stranded at
+                # STARTING forever even though the EXE was happily running.
+                # Fix: every tick, if metrics says ready and DB still says
+                # Starting, promote to Running.
+                if s.get("status") == "Starting" and s.get("installed"):
+                    try:
+                        m_promote = scum_proc.get_metrics(sid, s.get("folder_path"))
+                        if m_promote.get("ready"):
+                            await db.servers.update_one(
+                                {"id": sid}, {"$set": {"status": "Running"}},
+                            )
+                            s = {**s, "status": "Running"}
+                            logger.info(
+                                "Promoted %s Starting→Running (ready via %s)",
+                                s.get("name"),
+                                (scum_proc.REGISTRY.get(sid, {}).get("process") or {}).get("ready_reason") or "metric",
+                            )
+                        elif m_promote.get("running") is False:
+                            # Process died during boot — flip back to Stopped
+                            await db.servers.update_one(
+                                {"id": sid}, {"$set": {"status": "Stopped"}},
+                            )
+                            s = {**s, "status": "Stopped"}
+                            logger.warning("Boot failed for %s: process exited during Starting", s.get("name"))
+                    except Exception as e:
+                        logger.info("Starting→Running promotion check failed for %s: %s", s.get("name"), e)
+
+                # --- External-stop detector (admin pressed CTRL+C in SCUM's
+                # own console window) -------------------------------------
+                # When the admin saves the world by pressing CTRL+C inside
+                # SCUMServer.exe's console window, the PID dies but our
+                # backend still has status="Running" in Mongo. The frontend
+                # therefore keeps showing the server as up forever. We
+                # detect: status=Running BUT scum_proc says process is gone.
+                # In that case flip to Stopped — and mark it as expected so
+                # the crash backup logic below does NOT capture an emergency
+                # snapshot (the admin already saved via CTRL+C).
+                if s.get("status") == "Running" and s.get("installed"):
+                    try:
+                        m_running = scum_proc.get_metrics(sid, s.get("folder_path"))
+                        if m_running.get("running") is False:
+                            mark_expected_stop(sid)
+                            await db.servers.update_one(
+                                {"id": sid}, {"$set": {"status": "Stopped"}},
+                            )
+                            s = {**s, "status": "Stopped"}
+                            logger.warning(
+                                "External stop detected for %s — admin closed SCUM console (CTRL+C). Marked Stopped.",
+                                s.get("name"),
+                            )
+                    except Exception as e:
+                        logger.debug("external-stop check failed for %s: %s", s.get("name"), e)
+
+                # --- Keep running / Auto Start if closed ---
+                if auto.get("keep_running") and s.get("installed") and s.get("status") == "Stopped":
+                    if sid not in _expected_stops:
+                        last_start_time = _last_keep_running_start.get(sid, 0)
+                        if (now.timestamp() - last_start_time) >= 30:
+                            _last_keep_running_start[sid] = now.timestamp()
+                            logger.info("Keep-running enabled for %s and server is Stopped. Starting automatically...", s.get("name"))
+                            try:
+                                fresh = await db.servers.find_one({"id": sid}, {"_id": 0}) or s
+                                await _do_start_internal(sid, fresh)
+                                await _notify_lifecycle(
+                                    sid, "auto_restart",
+                                    f"**{s.get('name','Server')}** is stopped and keep_running is enabled. 🔄 Starting automatically.",
+                                    server_doc=fresh,
+                                )
+                            except Exception as kr_err:
+                                logger.error("Keep-running start failed for %s: %s", s.get("name"), kr_err)
+
+                # --- Scheduled restarts ---
+                if auto.get("enabled") and s.get("installed") and s.get("status") == "Running":
+                    restart_times = auto.get("restart_times") or []
+                    # v1.0.37h — Day-of-week filter. Admin checks specific
+                    # weekdays (sun/mon/tue/wed/thu/fri/sat) in the UI; we only
+                    # fire on those days. Empty list = legacy "every day".
+                    # `day_tag` was computed in the server's own timezone, so
+                    # use that weekday too (a 23:30 Istanbul restart should
+                    # count as Monday even if it's Tuesday in UTC).
+                    raw_days = auto.get("restart_days") or []
+                    allowed_days = set(d.lower() for d in raw_days)
+                    if allowed_days:
+                        # day_tag format: "YYYY-MM-DDTHH:MM" → reparse to get
+                        # weekday in the SAME timezone the hhmm match used.
+                        try:
+                            dow_dt = datetime.strptime(day_tag, "%Y-%m-%dT%H:%M")
+                            WEEKDAYS_LIST = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+                            dow_code = WEEKDAYS_LIST[dow_dt.weekday()]
+                        except Exception:
+                            WEEKDAYS_LIST = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+                            try:
+                                fallback_dt = srv_now if srv_tz_name else local_now
+                            except NameError:
+                                fallback_dt = local_now
+                            dow_code = WEEKDAYS_LIST[fallback_dt.weekday()]
+                        if dow_code not in allowed_days:
+                            restart_times = []  # skip — today isn't enabled
+                    if hhmm in restart_times and _last_restart_tick.get(sid) != day_tag:
+                        _last_restart_tick[sid] = day_tag
+                        logger.warning("Scheduler: scheduled restart firing for %s at %s", s.get("name"), hhmm)
+                        srv_name = s.get("name", "Server")
+                        await _notify_lifecycle(
+                            sid, "auto_restart",
+                            f"**{srv_name}** scheduled restart firing now (slot `{hhmm}`). Stopping gracefully…",
+                            server_doc=s,
+                        )
+                        try:
+                            await db.servers.update_one({"id": sid}, {"$set": {"status": "Updating"}})
+                            await _do_stop_internal(sid, take_backup=True)
+                            await asyncio.sleep(2.0)
+                            fresh = await db.servers.find_one({"id": sid}, {"_id": 0}) or s
+                            await _do_start_internal(sid, fresh)
+                            logger.info("Scheduler: scheduled restart complete for %s", s.get("name"))
+                            await _notify_lifecycle(
+                                sid, "auto_restart",
+                                f"**{srv_name}** ✅ restart complete — server is back online.",
+                                server_doc=fresh,
+                            )
+                        except Exception as e:
+                            logger.exception("Scheduler: scheduled restart failed for %s: %s", s.get("name"), e)
+                            await _notify_lifecycle(
+                                sid, "auto_restart",
+                                f"**{srv_name}** ⚠ restart FAILED: `{e}`",
+                                server_doc=s,
+                            )
+                # --- Auto update ---
+                if auto.get("auto_update_enabled") and s.get("installed"):
+                    interval = int(auto.get("update_check_interval_min") or 360)
+                    last = _last_update_check_at.get(sid, 0)
+                    if (now.timestamp() - last) >= interval * 60:
+                        _last_update_check_at[sid] = now.timestamp()
+                        # Reuse the shared parser so the scheduler agrees with
+                        # /api/steam/check-update on what "latest build" means
+                        # (in-game version string like "1.2.3.2.115523", NOT a
+                        # pubDate timestamp — admins compare against the value
+                        # they see in the game's main menu).
+                        try:
+                            info = await _fetch_latest_scum_version()
+                            build_id = info.get("version")
+                            if build_id and s.get("installed_build_id") and s["installed_build_id"] != build_id:
+                                await db.servers.update_one({"id": sid}, {"$set": {"update_available": True}})
+                                logger.info("Scheduler: update_available=True for %s (latest=%s installed=%s)",
+                                            s.get("name"), build_id, s.get("installed_build_id"))
+                                # Kick off graceful update flow (15-min lead):
+                                # notifications get stamped into Notifications.json
+                                # and the update actually runs when pending_update_at
+                                # is reached (see section below).
+                                try:
+                                    fresh = await db.servers.find_one({"id": sid}, {"_id": 0})
+                                    if fresh and not fresh.get("pending_update_at"):
+                                        await _schedule_graceful_update(sid, fresh, lead_minutes=15)
+                                        # Notify admins ONCE on detection so they
+                                        # can plan around the upcoming downtime.
+                                        await _notify_lifecycle(
+                                            sid, "auto_update",
+                                            f"**{s.get('name','Server')}** new SCUM build detected: `{build_id}` "
+                                            f"(installed: `{s.get('installed_build_id','?')}`). "
+                                            f"Auto-update will run in ~15 minutes.",
+                                            server_doc=fresh or s,
+                                        )
+                                except Exception as e:
+                                    logger.info("graceful update scheduling failed: %s", e)
+                        except Exception as e:
+                            logger.info("Scheduler steam check failed: %s", e)
+
+                # --- Pending graceful update: execute when target reached ---
+                pending = s.get("pending_update_at")
+                # Defensive cleanup: if there's no pending update but stale
+                # "_transient_update" notifications are still sitting in the
+                # settings doc / Notifications.json, strip them. Without this,
+                # SCUM keeps broadcasting "A new version is available... in 5
+                # minutes" every day at the same time (because the notifs are
+                # written with day="Everyday" — SCUM can't express "one-shot").
+                # Reported by user 2026-02: chat was spammed with stale update
+                # countdowns every day even though no update was happening.
+                # User request 2026-02 (v1.0.13): also strip ANY auto-generated
+                # restart/update kind notifications even WITHOUT the transient
+                # flag — they're leftovers from servers installed by manager
+                # version <= 1.0.8 which used to seed default English warnings
+                # ("The server will restart in 5 minutes." etc.). On those
+                # older servers SCUM keeps broadcasting them at every restart
+                # window. We delete them now and let admins re-add custom
+                # messages manually if they want.
+                if not pending:
+                    cur_notifs = (s.get("settings") or {}).get("notifications") or []
+                    auto_msg_patterns = [
+                        "the server will restart in",
+                        "a new version of the game is available",
+                        "sunucu yeniden başlayacak",
+                        "sunucu yeniden başlatılacak",
+                        "oyunun yeni sürümü mevcut",
+                    ]
+                    def _is_auto_legacy(n: Dict[str, Any]) -> bool:
+                        if not isinstance(n, dict):
+                            return False
+                        if n.get("_transient_update") or n.get("_lgss_auto"):
+                            return True
+                        msg = (n.get("message") or "").lower()
+                        return any(p in msg for p in auto_msg_patterns)
+                    stale = [n for n in cur_notifs if _is_auto_legacy(n)]
+                    if stale:
+                        clean_notifs = [n for n in cur_notifs if not _is_auto_legacy(n)]
+                        clean_settings = {**(s.get("settings") or {}), "notifications": clean_notifs}
+                        await db.servers.update_one(
+                            {"id": sid}, {"$set": {"settings": clean_settings}},
+                        )
+                        try:
+                            if s.get("folder_path"):
+                                save_notifications_to_disk(s["folder_path"], clean_notifs)
+                        except Exception as e:
+                            logger.info("stale notification cleanup write failed: %s", e)
+                        logger.warning("Removed %d stale auto notifications from %s", len(stale), s.get("name"))
+                if pending:
+                    try:
+                        target = datetime.fromisoformat(pending)
+                        if target.tzinfo is None:
+                            target = target.replace(tzinfo=timezone.utc)
+                        if now >= target:
+                            logger.warning("Graceful update firing for %s", s.get("name"))
+                            srv_name = s.get("name", "Server")
+                            await _notify_lifecycle(
+                                sid, "auto_update",
+                                f"**{srv_name}** auto-update firing now. Stopping server, running SteamCMD…",
+                                server_doc=s,
+                            )
+                            # 1. Pre-update backup (so an interrupted SteamCMD pass
+                            #    can be reverted).
+                            await _do_pre_stop_backup(sid, s, backup_type="auto")
+                            # 2. Stop the running EXE via the shared helper
+                            await db.servers.update_one(
+                                {"id": sid}, {"$set": {"status": "Updating"}},
+                            )
+                            await _do_stop_internal(sid, take_backup=False)
+                            # 3. Clear transient update notifications from settings
+                            clean_settings = {**(s.get("settings") or {})}
+                            notifs_clean = [
+                                n for n in (clean_settings.get("notifications") or [])
+                                if not (isinstance(n, dict) and n.get("_transient_update"))
+                            ]
+                            clean_settings["notifications"] = notifs_clean
+                            await db.servers.update_one(
+                                {"id": sid},
+                                {"$set": {
+                                    "settings": clean_settings,
+                                    "pending_update_at": None,
+                                }},
+                            )
+                            # 4. Rewrite Notifications.json without transients
+                            try:
+                                if s.get("folder_path"):
+                                    save_notifications_to_disk(s["folder_path"], notifs_clean)
+                            except Exception as e:
+                                logger.info("notification cleanup write failed: %s", e)
+                            # 5. SteamCMD update + restart. On Windows we run
+                            # install_server(run_first_boot=False) (idempotent
+                            # delta update) then re-spawn via _do_start_internal.
+                            # On the preview/dev environment scum_proc raises
+                            # RuntimeError; we fall through and just restart.
+                            await asyncio.sleep(1.0)
+                            setup_doc = await db.setup.find_one({"_id": SETUP_DOC_ID}, {"_id": 0}) or {}
+                            manager_path = setup_doc.get("manager_path") or ""
+                            if platform.system() == "Windows" and manager_path and s.get("folder_path"):
+                                def _run_update_job() -> Dict[str, Any]:
+                                    scum_proc.install_server(
+                                        server_id=sid,
+                                        folder_path=s.get("folder_path"),
+                                        manager_path=manager_path,
+                                        app_id=s.get("steam_app_id") or "3792580",
+                                        run_first_boot=False,
+                                    )
+                                    return scum_proc.wait_for_install(sid, timeout_sec=4 * 60 * 60)
+
+                                progress = await asyncio.to_thread(_run_update_job)
+                                if progress.get("phase") != "complete" or progress.get("error"):
+                                    raise RuntimeError(progress.get("error") or "SteamCMD update did not complete")
+                                info = await _fetch_latest_scum_version()
+                                version = info.get("version") or s.get("installed_build_id") or "unknown"
+                                await db.servers.update_one(
+                                    {"id": sid},
+                                    {"$set": {
+                                        "installed_build_id": version,
+                                        "update_available": False,
+                                    }},
+                                )
+                            else:
+                                logger.info("SteamCMD update skipped: Windows manager_path/folder_path unavailable.")
+                            fresh = await db.servers.find_one({"id": sid}, {"_id": 0}) or s
+                            try:
+                                await _do_start_internal(sid, fresh)
+                                # Refetch one more time so the embed shows the
+                                # new installed_build_id stamped by install_server's
+                                # on_complete callback.
+                                final = await db.servers.find_one({"id": sid}, {"_id": 0}) or fresh
+                                await _notify_lifecycle(
+                                    sid, "auto_update",
+                                    f"**{srv_name}** ✅ update complete — new build `{final.get('installed_build_id','?')}`, server is back online.",
+                                    server_doc=final,
+                                )
+                            except Exception as e:
+                                logger.exception("post-update start failed for %s: %s", s.get("name"), e)
+                                await _notify_lifecycle(
+                                    sid, "auto_update",
+                                    f"**{srv_name}** ⚠ post-update start FAILED: `{e}`",
+                                    server_doc=fresh,
+                                )
+                    except Exception as e:
+                        logger.info("pending update handling failed: %s", e)
+
+                # --- Activity time-series sample (every ACTIVITY_SAMPLE_INTERVAL_SEC) ---
+                # Record one data point per server every 5 minutes while the
+                # process is alive. Powers the 24h activity chart on the UI.
+                # Storage is cheap: ~288 rows per server per day, ~2KB.
+                last_sample = _last_activity_sample_at.get(sid, 0)
+                if (now.timestamp() - last_sample) >= ACTIVITY_SAMPLE_INTERVAL_SEC:
+                    _last_activity_sample_at[sid] = now.timestamp()
+                    try:
+                        m = scum_proc.get_metrics(sid, s.get("folder_path"))
+                        if m.get("running"):
+                            await db.server_activity.insert_one({
+                                "server_id": sid,
+                                "ts": now,
+                                "players": m.get("players"),
+                                "max_players": m.get("max_players_live"),
+                                "cpu_percent": m.get("cpu_percent"),
+                                "memory_mb": m.get("memory_mb"),
+                                "ready": bool(m.get("ready")),
+                            })
+                    except Exception as e:
+                        logger.info("activity sample failed for %s: %s", s.get("name"), e)
+
+                # --- Config file re-import (every CONFIG_REIMPORT_INTERVAL_SEC) ---
+                # When an admin edits settings from inside the game (via #commands
+                # or the in-game admin panel), SCUM rewrites ServerSettings.ini on
+                # disk. We periodically re-read those files and merge into the
+                # manager's settings so the UI reflects the live game state.
+                if s.get("installed") and s.get("folder_path") and s.get("status") in ("Running", "Starting"):
+                    last_reimport = _last_config_reimport_at.get(sid, 0)
+                    if (now.timestamp() - last_reimport) >= CONFIG_REIMPORT_INTERVAL_SEC:
+                        _last_config_reimport_at[sid] = now.timestamp()
+                        try:
+                            parsed = parse_real_config_dir(s["folder_path"])
+                            current = s.get("settings", {}) or {}
+                            merged = {**current}
+                            changed = False
+                            for k, v in parsed.items():
+                                # Skip empty parses (file not written yet / missing section)
+                                if isinstance(v, (list, dict)) and not v:
+                                    continue
+                                if merged.get(k) != v:
+                                    merged[k] = v
+                                    changed = True
+                            if changed:
+                                await db.servers.update_one({"id": sid}, {"$set": {"settings": merged}})
+                                logger.info("Config re-import: %s picked up on-disk changes", s.get("name"))
+                        except Exception as e:
+                            logger.info("Config re-import failed for %s: %s", s.get("name"), e)
+
+                # --- Auto backup + crash-safe emergency backup ---
+                # Two independent triggers:
+                #   1) Periodic: if automation.backup_enabled, create a backup every
+                #      automation.backup_interval_min (default 120). Pruned to
+                #      keep-count so disk doesn't fill.
+                #   2) Crash detector: we remember whether the SCUM process was
+                #      alive last tick; if it was Running/Starting and is suddenly
+                #      gone without an admin-driven Stop, snapshot RIGHT NOW before
+                #      the player's progress is potentially corrupted by the crash.
+                if s.get("installed") and s.get("folder_path"):
+                    setup_doc = await db.setup.find_one({"_id": SETUP_DOC_ID}, {"_id": 0}) or {}
+                    manager_path = setup_doc.get("manager_path")
+                    if manager_path:
+                        server_folder = s.get("folder_name") or f"Server{s.get('index', 1)}"
+                        running_now = s.get("status") in ("Running", "Starting")
+
+                        # (1) Periodic
+                        if auto.get("backup_enabled"):
+                            interval_min = int(auto.get("backup_interval_min") or 10)
+                            last_bk = _last_backup_at.get(sid, 0)
+                            if (now.timestamp() - last_bk) >= interval_min * 60:
+                                _last_backup_at[sid] = now.timestamp()
+                                try:
+                                    await asyncio.to_thread(
+                                        scum_backup.create_backup,
+                                        server_id=sid,
+                                        folder_path=s["folder_path"],
+                                        manager_path=manager_path,
+                                        server_folder=server_folder,
+                                        backup_type="auto",
+                                    )
+                                    # Prune: keep max N auto-backups
+                                    keep = int(auto.get("backup_keep_count") or 30)
+                                    await asyncio.to_thread(
+                                        scum_backup.prune_old_backups,
+                                        manager_path=manager_path,
+                                        server_folder=server_folder,
+                                        keep_count=keep,
+                                    )
+                                    logger.info("Auto-backup: %s done", s.get("name"))
+                                except Exception as e:
+                                    logger.info("Auto-backup failed for %s: %s", s.get("name"), e)
+
+                        # (2) Crash detector
+                        prev = _crash_watch.get(sid, {})
+                        if prev.get("was_running") and not running_now:
+                            # Running → dead transition. If this was triggered
+                            # by an admin action (Stop / Restart / Update /
+                            # scheduled restart), the endpoint marked it via
+                            # mark_expected_stop() — we pop that flag here and
+                            # skip the crash backup entirely. Otherwise we
+                            # treat it as a real crash: capture a snapshot and
+                            # flag the server for auto-recovery on next start.
+                            if sid in _expected_stops:
+                                _expected_stops.discard(sid)
+                                logger.info(
+                                    "Stop transition for %s was admin-initiated; no crash backup.",
+                                    s.get("name"),
+                                )
+                            else:
+                                try:
+                                    await asyncio.to_thread(
+                                        scum_backup.create_backup,
+                                        server_id=sid,
+                                        folder_path=s["folder_path"],
+                                        manager_path=manager_path,
+                                        server_folder=server_folder,
+                                        backup_type="crash",
+                                    )
+                                    await db.servers.update_one(
+                                        {"id": sid},
+                                        {"$set": {"crash_recovery_pending": True,
+                                                  "last_crash_at": now.isoformat()}},
+                                    )
+                                    logger.warning("Crash backup captured for %s", s.get("name"))
+                                    
+                                    # Auto-restart on crash logic
+                                    if auto.get("auto_restart_on_crash", True):
+                                        logger.warning("Auto-restart on crash is enabled for %s. Restarting...", s.get("name"))
+                                        fresh = await db.servers.find_one({"id": sid}, {"_id": 0}) or s
+                                        await _do_start_internal(sid, fresh)
+                                        await _notify_lifecycle(
+                                            sid, "auto_restart",
+                                            f"**{s.get('name','Server')}** has crashed. 🔄 Auto-restart on crash triggered.",
+                                            server_doc=fresh,
+                                        )
+                                except Exception as e:
+                                    logger.info("Crash backup or auto-restart failed for %s: %s", s.get("name"), e)
+                        _crash_watch[sid] = {"was_running": running_now}
+
+                # --- Vehicle-claim detector (SCUM.db owner-diff) ---
+                # SCUM writes no "player claimed X" log line. We detect it by
+                # polling vehicle_entity and comparing owner_sid between ticks.
+                # Any row whose owner changed None→SID (or SID→different SID)
+                # becomes a synthetic `vehicle_claim` event so admins see it
+                # in the Logs page + Discord.
+                if s.get("installed") and s.get("folder_path") and s.get("status") in ("Running", "Starting"):
+                    try:
+                        new_snapshot = await asyncio.to_thread(
+                            scum_db.read_vehicle_ownership, s["folder_path"],
+                        )
+                        old_snapshot = _vehicle_ownership_snapshot.get(sid) or {}
+                        claim_events: List[Dict[str, Any]] = []
+                        for vid, row in new_snapshot.items():
+                            old_row = old_snapshot.get(vid)
+                            new_owner = row.get("owner_sid")
+                            old_owner = (old_row or {}).get("owner_sid")
+                            if new_owner and new_owner != old_owner:
+                                # Changed hands (either from unowned or from another player)
+                                klass = row.get("klass") or ""
+                                pretty = klass.replace("BP_", "").replace("_C", "").replace("_", " ").strip() or klass
+                                ts_iso = now.isoformat()
+                                ev = {
+                                    "type": "vehicle_claim",
+                                    "ts": ts_iso,
+                                    "server_id": sid,
+                                    "source_file": "scum.db",
+                                    "vehicle_id": vid,
+                                    "vehicle_class": klass,
+                                    "vehicle_pretty": pretty,
+                                    "steam_id": new_owner,
+                                    "player_name": row.get("owner_name"),
+                                    "previous_owner_sid": old_owner,
+                                    "action": "claimed" if not old_owner else "transferred",
+                                    "raw": f"[SCUM.db] {pretty} (VehicleId={vid}) owner={new_owner}",
+                                }
+                                # Stable id so the same claim isn't re-forwarded next tick
+                                import hashlib as _h
+                                ev["id"] = _h.sha1(
+                                    f"{sid}|claim|{vid}|{new_owner}".encode()
+                                ).hexdigest()[:24]
+                                claim_events.append(ev)
+                        if claim_events:
+                            r = await _store_events_and_forward(sid, claim_events)
+                            logger.info(
+                                "Claim detector: %s → %d new events (%d forwarded)",
+                                s.get("name"), r.get("stored", 0), r.get("forwarded", 0),
+                            )
+                        _vehicle_ownership_snapshot[sid] = new_snapshot
+                    except Exception as e:
+                        logger.info("Claim detector failed for %s: %s", s.get("name"), e)
+        except Exception as e:
+            logger.exception("Scheduler tick failed: %s", e)
+        await asyncio.sleep(10)
+
+
+@app.on_event("startup")
+async def _start_scheduler():
+    # Run all DB migrations + scheduler bootstrap as a background task so:
+    #   * uvicorn reaches "Application startup complete" immediately,
+    #   * port 8001 starts accepting requests right away,
+    #   * a missing/down MongoDB doesn't trap the server in
+    #     "Waiting for application startup" for 90+ seconds (3 migrations
+    #     × 30s default timeout).
+    # MongoDB outages now surface as fast HTTP errors instead of a hung process.
+    global _startup_task
+    if _startup_task is None or _startup_task.done():
+        _startup_task = asyncio.create_task(_run_startup_migrations())
+
+
+async def _run_startup_migrations():
+    global _scheduler_task
+    # v1.0.23 reversal: v1.0.23 mistakenly shifted query_port from game+1 to
+    # game+3 thinking SCUM needed query OUTSIDE the 3-port range. That was
+    # wrong — SCUM's actual layout is game/query/steam = port/+1/+2, with
+    # PLAYERS connecting on port+2 (the "Steam port"), NOT on the query.
+    # We reverse the v1.0.23 migration for any not-yet-installed server whose
+    # query is now exactly game+3 (the v1.0.23 default), moving it back to +1.
+    try:
+        affected = await db.servers.find(
+            {"installed": False},
+            {"_id": 0, "id": 1, "game_port": 1, "query_port": 1},
+        ).to_list(500)
+        reverted = 0
+        for s in affected:
+            gp = s.get("game_port") or 7777
+            qp = s.get("query_port") or 0
+            if qp == gp + 3:  # v1.0.23 anti-pattern
+                await db.servers.update_one({"id": s["id"]}, {"$set": {"query_port": gp + 1}})
+                reverted += 1
+        if reverted:
+            logger.info("v1.0.23 query-port reversal: shifted %d query ports from +3 back to +1 (SCUM standard)", reverted)
+    except Exception as e:
+        logger.info("v1.0.23 query-port reversal skipped: %s", e)
+    # One-time migration: earlier versions defaulted to game=7779 / query=7780.
+    # For any server that has NEVER been installed (admin hasn't configured it
+    # on disk yet), silently shift those defaults to the new values (7777/7778)
+    # so the UI reflects what brand-new servers will get. Installed servers
+    # keep whatever the admin chose.
+    try:
+        r = await db.servers.update_many(
+            {"installed": False, "game_port": 7779, "query_port": 7780},
+            {"$set": {"game_port": 7777, "query_port": 7778}},
+        )
+        if r.modified_count:
+            logger.info("Port default migration: shifted %d server(s) 7779/7780 → 7777/7778", r.modified_count)
+    except Exception as e:
+        logger.info("port migration skipped: %s", e)
+    # Reset stranded server states on startup (e.g. if the manager was shut down during install/update/start)
+    try:
+        r = await db.servers.update_many(
+            {"status": {"$in": ["Installing", "Updating", "Starting", "Stopping"]}},
+            {"$set": {"status": "Stopped"}}
+        )
+        if r.modified_count:
+            logger.info("Stranded states migration: reset %d server(s) from Installing/Updating/Starting → Stopped", r.modified_count)
+    except Exception as e:
+        logger.info("stranded states migration skipped: %s", e)
+
+    global _scheduler_task, _fast_log_scanner_task
+    if _scheduler_task is None or _scheduler_task.done():
+        _scheduler_task = asyncio.create_task(_tick_scheduler())
+        logger.info("LGSS automation scheduler started (tick=10s)")
+    if _fast_log_scanner_task is None or _fast_log_scanner_task.done():
+        _fast_log_scanner_task = asyncio.create_task(_run_fast_log_scanner())
+        logger.info("LGSS fast log scanner started (tick=2s)")
+
+    # Start Remote API server on startup if enabled
+    try:
+        setup = await db.setup.find_one({"_id": SETUP_DOC_ID})
+        if setup and setup.get("api_enabled"):
+            await start_remote_api_server(setup.get("api_port", 8002))
+    except Exception as e:
+        logger.error("Failed to start Remote API server on startup: %s", e)
+
+    # v1.0.36 migration: earlier versions stamped installed_build_id with a
+    # timestamp-style token (`build-1779386976`) instead of the actual SCUM
+    # in-game version (`1.2.3.2.115523`). That made the dashboard show a
+    # meaningless number AND the auto-update check ALWAYS reported "update
+    # available" because no Steam-side version string ever matches that format.
+    # On startup, fetch the latest version from Steam RSS once and rewrite any
+    # server whose installed_build_id matches the legacy format.
+    try:
+        legacy = await db.servers.find(
+            {"installed": True, "installed_build_id": {"$regex": "^build-"}},
+            {"_id": 0, "id": 1},
+        ).to_list(500)
+        if legacy:
+            info = await _fetch_latest_scum_version()
+            ver = info.get("version")
+            if ver:
+                for s in legacy:
+                    await db.servers.update_one(
+                        {"id": s["id"]},
+                        {"$set": {"installed_build_id": ver, "update_available": False}},
+                    )
+                logger.info("v1.0.36 build-id migration: rewrote %d legacy build-<ts> tokens → %s", len(legacy), ver)
+    except Exception as e:
+        logger.info("v1.0.36 build-id migration skipped: %s", e)
+    # TTL index on activity samples — auto-delete rows older than 30 days.
+    # If an older version created the index with a different TTL, drop and
+    # recreate so the new retention takes effect.
+    try:
+        existing = await db.server_activity.index_information()
+        current_ttl = existing.get("activity_ttl", {}).get("expireAfterSeconds")
+        if current_ttl is not None and current_ttl != 30 * 24 * 3600:
+            await db.server_activity.drop_index("activity_ttl")
+        await db.server_activity.create_index(
+            "ts", expireAfterSeconds=30 * 24 * 3600, name="activity_ttl",
+        )
+        await db.server_activity.create_index([("server_id", 1), ("ts", -1)])
+    except Exception as e:
+        logger.info("activity index setup skipped: %s", e)
+    # v1.0.37k — Indexes on server_events to optimize Logs and Players dashboards queries
+    try:
+        await db.server_events.create_index([("server_id", 1), ("ts", -1)])
+        await db.server_events.create_index([("server_id", 1), ("type", 1), ("ts", 1)])
+        await db.server_events.create_index([("server_id", 1), ("steam_id", 1)])
+    except Exception as e:
+        logger.info("server_events index setup failed: %s", e)
+    # v1.0.37g — Per-server Discord bot auto-start on boot. Iterate every
+    # server profile and reconnect any bot the admin previously enabled. Each
+    # server has its OWN token + status channel + event channel routing under
+    # `discord_bot`.
+    try:
+        async for srv in db.servers.find({}, {"_id": 0}):
+            bot_cfg = srv.get("discord_bot") or {}
+            if not (bot_cfg.get("enabled") and bot_cfg.get("token")):
+                continue
+            sid = srv["id"]
+            await scum_discord.start_bot(
+                sid,
+                bot_cfg["token"],
+                _make_discord_state_fn(sid),
+                status_channel_id=bot_cfg.get("status_channel_id") or None,
+                message_id_store=_make_discord_msg_id_store(sid),
+                initial_message_id=bot_cfg.get("status_message_id") or None,
+                event_channels=bot_cfg.get("event_channels") or {},
+                server_name=srv.get("name") or "",
+                embed_title=bot_cfg.get("embed_title") or None,
+                embed_color=bot_cfg.get("embed_color") or None,
+                embed_image=bot_cfg.get("embed_image") or None,
+                embed_footer=bot_cfg.get("embed_footer") or None,
+                hide_player_names=bool(bot_cfg.get("hide_player_names")),
+            )
+            logger.info("Discord bot auto-started for server %s.", sid)
+    except Exception as e:
+        logger.info("Discord bot auto-start sweep skipped: %s", e)
+
+
+async def _cancel_background_task(task: Optional[asyncio.Task], name: str) -> None:
+    if task is None:
+        return
+    if not task.done():
+        task.cancel()
+    try:
+        await asyncio.wait_for(task, timeout=5.0)
+    except asyncio.CancelledError:
+        pass
+    except asyncio.TimeoutError:
+        logger.warning("%s did not stop within timeout", name)
+    except Exception as e:
+        logger.info("%s stopped with error: %s", name, e)
+
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    global _startup_task, _scheduler_task, _fast_log_scanner_task
+    await _cancel_background_task(_startup_task, "startup migrations")
+    await _cancel_background_task(_scheduler_task, "automation scheduler")
+    await _cancel_background_task(_fast_log_scanner_task, "fast log scanner")
+    _startup_task = None
+    _scheduler_task = None
+    _fast_log_scanner_task = None
+    
+    # Stop Remote API server
+    try:
+        await stop_remote_api_server()
+    except Exception:
+        pass
+
+    # Cleanly disconnect every per-server bot.
+    try:
+        for sid in list(scum_discord.get_all_statuses().keys()):
+            try:
+                await scum_discord.stop_bot(sid)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    client.close()

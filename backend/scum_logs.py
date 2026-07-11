@@ -1,0 +1,1161 @@
+"""SCUM server log parsing.
+
+SCUM writes logs to `SCUM/Saved/SaveFiles/Logs/` in **UTF-16 LE with BOM**.
+Each file has a single "Game version: ..." header line followed by event lines.
+Event lines share a common prefix:  `YYYY.MM.DD-HH.MM.SS: <content>`
+
+File types this module understands:
+    admin_*.log        — admin command invocations (teleport, spawnitem, ban, kick, ...)
+    chat_*.log         — in-game chat (Global / Squad / Local)
+    login_*.log        — player connect / disconnect
+    kill_*.log         — PvP and PvE kills (weapon + distance + coords)
+    economy_*.log      — trader transactions (buy / sell / balances)
+    violations_*.log   — anti-cheat detections
+    famepoints_*.log   — fame point gains / losses
+    raid_*.log         — raid time windows start/stop
+    armor_absorption_*.log, chest_ownership_*.log — rarely used, parsed as generic
+
+Each parser returns a list of `Event` dicts ready to be stored in MongoDB or broadcast
+to a WebSocket stream. All parsers are pure functions; they do NO I/O so they can be
+reused by the live file watcher, the bulk importer, and pytest.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+# ----- encoding helpers ---------------------------------------------------
+
+def _decode_scum_log_bytes(raw: bytes) -> str:
+    """SCUM logs are UTF-16 LE with BOM. Decode robustly."""
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return raw.decode("utf-16", errors="replace")
+    # Heuristic: every other byte is null
+    if len(raw) > 4 and raw[1] == 0 and raw[3] == 0:
+        return raw.decode("utf-16-le", errors="replace")
+    return raw.decode("utf-8", errors="replace")
+
+
+def read_log_file(path: str | Path) -> str:
+    return _decode_scum_log_bytes(Path(path).read_bytes())
+
+
+def get_new_log_text(path: str | Path, prev_offset: int) -> tuple[str, int]:
+    """Read only new complete lines from a log file. Returns (text, new_offset)."""
+    p = Path(path)
+    if not p.exists():
+        return "", 0
+    stat = p.stat()
+    current_size = stat.st_size
+    if current_size <= prev_offset:
+        return "", prev_offset
+    
+    if current_size < prev_offset:
+        # File truncated or rotated -> read from beginning
+        prev_offset = 0
+
+    with p.open("rb") as f:
+        f.seek(prev_offset)
+        raw = f.read(current_size - prev_offset)
+
+    if not raw:
+        return "", prev_offset
+
+    # Detect encoding to find the proper newline sequence
+    is_utf16 = False
+    try:
+        # Check first 4 bytes of the actual file to see if it is UTF-16
+        with p.open("rb") as f:
+            header = f.read(4)
+            if header[:2] in (b"\xff\xfe", b"\xfe\xff") or (len(header) > 3 and header[1] == 0 and header[3] == 0):
+                is_utf16 = True
+    except Exception:
+        pass
+
+    # Find the last newline sequence in raw bytes
+    newline_seq = b"\n\x00" if is_utf16 else b"\n"
+    
+    # Check if raw ends with newline
+    if raw.endswith(newline_seq):
+        valid_len = len(raw)
+        new_offset = prev_offset + valid_len
+        raw_valid = raw
+    else:
+        # If it doesn't end with a newline, check if the file is still being written to.
+        # If it hasn't been modified in the last 1.0 second, we treat it as complete.
+        import time
+        if (time.time() - stat.st_mtime) > 1.0:
+            valid_len = len(raw)
+            new_offset = prev_offset + valid_len
+            raw_valid = raw
+        else:
+            # Still active, only read up to the last newline
+            last_nl = raw.rfind(newline_seq)
+            if last_nl == -1:
+                return "", prev_offset
+            valid_len = last_nl + len(newline_seq)
+            new_offset = prev_offset + valid_len
+            raw_valid = raw[:valid_len]
+
+    text = _decode_scum_log_bytes(raw_valid)
+    return text, new_offset
+
+
+# ----- noise / garbage line filter ----------------------------------------
+#
+# SCUM is an Unreal Engine 4 game. Its dedicated server writes the *game-event*
+# log files (login_*.log, kill_*.log, etc.) mixed with UE4 engine bootstrapping
+# noise that the server can't suppress without a custom engine build.
+#
+# Research sources:
+#   • Unreal Engine UE_LOG categories documented at:
+#     https://docs.unrealengine.com/5.0/en-US/API/Runtime/Core/Logging/
+#   • SCUM admin community reports on forums.g-portal.com and Discord:
+#     "Log:", "LogInit:", "LogSteamShared:", "LogOnline:" prefixed lines are
+#     engine-internal and carry no game-state information for admins.
+#   • Observed in real SCUM Saved/SaveFiles/Logs/*.log captures.
+#
+# We drop a line at the EARLIEST possible point (before any parser sees it)
+# so parsers never have to deal with it.
+
+# Fast prefix set — covers the vast majority of noise lines.
+# All checks are done on the lowercased body after the timestamp is stripped.
+_NOISE_PREFIXES: tuple[str, ...] = (
+    # ── Unreal Engine system prefixes ──────────────────────────────────────
+    "loginit:",          # UE4 core initialisation (config loading, module init)
+    "logtempvisualinfo:",# UE4 temp visual debug info
+    "logonline:",        # UE4 Online Subsystem (Steam backend) verbose chatter
+    "lognet:",           # UE4 network driver internals
+    "logsteamshared:",   # Steam SDK initialisation
+    "logmovie:",         # video intro / loading screen
+    "logwindows:",       # Win32 crash handler registration
+    "logplatformfile:",  # sandboxed file I/O setup
+    "logpackagelocalizationloader:",  # pak localisation
+    "logstreamingpause:",# level streaming pauses
+    "logaborted:",       # abnormal termination detail
+    # ── SCUM game log system noise ─────────────────────────────────────────
+    # Loot / world initialisation — appears on every server boot
+    "log: initializing loot",
+    "log: no item spawning parameter overrides",
+    "log: initializing items",
+    "log: loot tree",
+    "log: loading",
+    "log: finished",
+    "log: created",
+    "log: saved",
+    "log: generated",
+    # ── Bunker / zone timed messages (not player-relevant) ─────────────────
+    # e.g. "Log: Bunker A1 cooldown: 23h 30m"  — already captured by LogBunkerLock
+    "log: bunker",
+    # ── Server-internal economy housekeeping ───────────────────────────────
+    "[trade] tradeable: ",          # internal stock-refresh, not a player trade
+    "[merchant]",                   # NPC spawn logs
+    # ── Time/weather cycle duration stats ─────────────────────────────────
+    # e.g. "Log: 17: 03:18 d - 04:04 d" (day/night cycle lengths)
+    # Matched by regex below because they're not all simple prefixes.
+)
+
+# Regex for patterns that can't be expressed as simple prefixes.
+_NOISE_LINE_RX = re.compile(
+    r"""
+    # Day/night cycle duration report: "Log: 17: 03:18 d - 04:04 d"
+    log:\s*\d+:\s*\d+(?:[:.]\d+)*\s+[a-z]
+    |
+    # UE4 generic "Log: <capitalised noun phrase>" startup announcements
+    log:\s+(?:initializ|loading|starting|finish|generat|caching|saving|parsing|registering|setting up)\w*
+    |
+    # Any line that is purely internal UE4 category noise  (e.g. "LogOnlineSession: ...")
+    log(?:init|online|net|steam|windows|movie|platformfile|streamingpause|aborted|tempvisualinfo)\w*:
+    |
+    # Blank timestamp body — the "Game version: X.Y" header
+    game\s+version:
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _is_noise_line(body: str) -> bool:
+    """Return True if `body` (the part AFTER the timestamp) is engine/startup noise
+    that should be discarded before any parser ever sees it."""
+    lo = body.lower().lstrip()
+    for prefix in _NOISE_PREFIXES:
+        if lo.startswith(prefix):
+            return True
+    return bool(_NOISE_LINE_RX.search(lo))
+
+
+
+# ----- common primitives --------------------------------------------------
+
+# '2026.01.04-13.41.43: <rest>'
+_LINE_RX = re.compile(r"^(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}):\s*(.*)$")
+
+# v1.0.36 — Permissive WHO regex.
+# Accepts ANY characters except "(" in the player name portion since the
+# trailing `(N)` entity-id is the only reliable terminator.
+# The Steam ID is exactly 17 digits — keeps the front anchor unambiguous.
+_WHO_RX = re.compile(r"(\d{17}):([^()]+?)\((\d+)\)")
+
+
+def _parse_ts(ts: str) -> Optional[str]:
+    try:
+        dt = datetime.strptime(ts, "%Y.%m.%d-%H.%M.%S").replace(tzinfo=timezone.utc)
+        return dt.isoformat()
+    except ValueError:
+        return None
+
+
+def _event_id(*parts: Any) -> str:
+    """Deterministic id so replaying a log doesn't create duplicates in Mongo."""
+    s = "|".join(str(p) for p in parts)
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:24]
+
+
+# ----- individual parsers -------------------------------------------------
+
+def parse_admin_line(ts_iso: str, body: str) -> Optional[Dict[str, Any]]:
+    # SCUM's real admin log format is:
+    #   '76561199...:Gabriel(10)' '#Command args...'
+    # The legacy "Command: '...'" format still appears in some mods.
+    # Try modern hash-prefix format first.
+    m = re.match(r"'(?P<who>[^']+)'\s+'#(?P<cmd>[^']*)'", body)
+    if not m:
+        m = re.match(r"'(?P<who>[^']+)'\s+Command:\s+'(?P<cmd>[^']+)'", body)
+    if m:
+        who = m.group("who")
+        cmd_full = m.group("cmd").strip()
+        parts = cmd_full.split(None, 1)
+        verb = parts[0].lower() if parts else ""
+        args = parts[1] if len(parts) > 1 else ""
+        w = _WHO_RX.search(who)
+        return {
+            "type": "admin",
+            "ts": ts_iso,
+            "steam_id": w.group(1) if w else None,
+            "player_name": w.group(2) if w else None,
+            "entity_id": int(w.group(3)) if w else None,
+            "command": verb or "?",
+            "args": args,
+            "raw": body,
+        }
+
+    # SCUM 1.2+ map-click teleport event:
+    #   'SID:NAME(N)' Used map click teleport to player: 'SID2:NAME2(N2)' Location: X=... Y=... Z=...
+    mc = re.match(
+        r"'(?P<who>[^']+)'\s+Used\s+map\s+click\s+teleport\s+to\s+player:\s+'(?P<target>[^']+)'"
+        r"(?:\s+Location:\s*X=(?P<x>-?[\d.]+)\s+Y=(?P<y>-?[\d.]+)\s+Z=(?P<z>-?[\d.]+))?",
+        body, flags=re.IGNORECASE,
+    )
+    if mc:
+        w = _WHO_RX.search(mc.group("who"))
+        tw = _WHO_RX.search(mc.group("target"))
+        loc = None
+        if mc.group("x") is not None:
+            loc = {"x": float(mc.group("x")), "y": float(mc.group("y")), "z": float(mc.group("z"))}
+        return {
+            "type": "admin",
+            "ts": ts_iso,
+            "steam_id": w.group(1) if w else None,
+            "player_name": w.group(2) if w else None,
+            "entity_id": int(w.group(3)) if w else None,
+            "command": "map_click_teleport",
+            "action": "teleport_to_player",
+            "target_steam_id": tw.group(1) if tw else None,
+            "target_name": tw.group(2) if tw else None,
+            "location": loc,
+            "raw": body,
+        }
+
+    # SCUM 1.2+ TeleportTo target event (the admin who RAN TeleportTo logs via
+    # the Command branch above; this line logs the PLAYER who was teleported):
+    #   'SID:NAME(N)' Target of TeleportTo: 'SID2:NAME2(N2)' Location: X=... Y=... Z=...
+    tt = re.match(
+        r"'(?P<who>[^']+)'\s+Target\s+of\s+TeleportTo:\s+'(?P<by>[^']+)'"
+        r"(?:\s+Location:\s*X=(?P<x>-?[\d.]+)\s+Y=(?P<y>-?[\d.]+)\s+Z=(?P<z>-?[\d.]+))?",
+        body, flags=re.IGNORECASE,
+    )
+    if tt:
+        w = _WHO_RX.search(tt.group("who"))
+        bw = _WHO_RX.search(tt.group("by"))
+        loc = None
+        if tt.group("x") is not None:
+            loc = {"x": float(tt.group("x")), "y": float(tt.group("y")), "z": float(tt.group("z"))}
+        return {
+            "type": "admin",
+            "ts": ts_iso,
+            "steam_id": w.group(1) if w else None,
+            "player_name": w.group(2) if w else None,
+            "entity_id": int(w.group(3)) if w else None,
+            "command": "teleport_target",
+            "action": "teleported_by_admin",
+            "admin_steam_id": bw.group(1) if bw else None,
+            "admin_name": bw.group(2) if bw else None,
+            "location": loc,
+            "raw": body,
+        }
+
+    return None
+
+
+def parse_chat_line(ts_iso: str, body: str) -> Optional[Dict[str, Any]]:
+    # Real SCUM server chat log format (primary):
+    #   '76561199...:Gabriel(10)' 'Local: hello testing'
+    # Legacy/alternate format we still support:
+    #   '76561199...:Gabriel(10)' 'Local' 'hello testing'
+    channel = None
+    msg = None
+    who = None
+
+    # Primary: 'who' 'Channel: message'
+    m = re.match(
+        r"'(?P<who>[^']+)'\s+'(?P<channel>Global|Squad|Local|Admin|Whisper|Team)\s*:\s*(?P<msg>.*)'\s*$",
+        body,
+    )
+    if m:
+        who = m.group("who")
+        channel = m.group("channel")
+        msg = m.group("msg")
+    else:
+        # Legacy: 'who' 'Channel' 'message'
+        m = re.match(
+            r"'(?P<who>[^']+)'\s+'(?P<channel>Global|Squad|Local|Admin|Whisper|Team)'\s+'(?P<msg>.*)'\s*$",
+            body,
+        )
+        if not m:
+            return None
+        who = m.group("who")
+        channel = m.group("channel")
+        msg = m.group("msg")
+
+    w = _WHO_RX.search(who)
+    return {
+        "type": "chat",
+        "ts": ts_iso,
+        "channel": channel,
+        "steam_id": w.group(1) if w else None,
+        "player_name": w.group(2) if w else None,
+        "entity_id": int(w.group(3)) if w else None,
+        "message": msg,
+        "raw": body,
+    }
+
+
+def parse_login_line(ts_iso: str, body: str) -> Optional[Dict[str, Any]]:
+    # '76561199...:WXSO(1)' logged in at: X=... Y=... Z=...
+    m = re.match(
+        r"'(?P<who>[^']+)'\s+(?P<action>logged in|logged out|disconnected|connected)\b(?P<rest>.*)$",
+        body,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return None
+    w = _WHO_RX.search(m.group("who"))
+    return {
+        "type": "login",
+        "ts": ts_iso,
+        "action": m.group("action").lower().replace(" ", "_"),
+        "steam_id": w.group(1) if w else None,
+        "player_name": w.group(2) if w else None,
+        "entity_id": int(w.group(3)) if w else None,
+        "raw": body,
+    }
+
+
+def parse_kill_line(ts_iso: str, body: str) -> Optional[Dict[str, Any]]:
+    """Parse SCUM kill_*.log entries. Format is:
+        Died: VICTIM (STEAM_ID), Killer: KILLER (STEAM_ID) Weapon: X [Projectile]
+        S[KillerLoc: A,B,C VictimLoc: A,B,C, Distance: 42.12 m] C[...]
+
+    The server emits TWO lines per kill: a human-readable one (the one we want)
+    and a JSON companion. We ignore the JSON line (handled by early-return) but
+    keep it as `raw` if the regex misses.
+    """
+    # Skip the JSON companion line — it starts with '{"Killer":'
+    if body.lstrip().startswith("{"):
+        return {"_skip": True}
+
+    # Real format: "Died: NAME (SID), Killer: NAME (SID) Weapon: W [TAG]
+    #               S[... Distance: 1.91 m] C[... Distance: 2.07 m]"
+    # The C[...] block (client-side) has the most reliable "effective" distance
+    # after lag compensation; prefer it, fall back to S[...] (server-side).
+    m = re.search(
+        r"Died:\s*(?P<vn>.+?)\s*\((?P<vs>\d{17})\),\s*"
+        r"Killer:\s*(?P<kn>.+?)\s*\((?P<ks>\d{17})\)\s+"
+        r"Weapon:\s*(?P<w>Weapon_\S+|\S+?)(?:\s*\[[^\]]*\])?\s+"
+        r"S\[[^\]]*?Distance:\s*(?P<sd>[0-9.]+)\s*m\]",
+        body,
+    )
+    cd = None
+    if m:
+        cm = re.search(r"C\[[^\]]*?Distance:\s*([0-9.]+)\s*m\]", body)
+        if cm:
+            cd = cm.group(1)
+    if not m:
+        # Legacy variant "Killer: ... Victim: ..." kept as fallback for old servers
+        legacy = re.search(
+            r"Killer:\s*(?P<kn>.+?)\s*\((?P<ks>\d{17})\).*?"
+            r"Victim:\s*(?P<vn>.+?)\s*\((?P<vs>\d{17})\).*?"
+            r"Weapon:\s*(?P<w>\S+).*?Distance:\s*(?P<d>[0-9.]+)",
+            body, flags=re.IGNORECASE,
+        )
+        if not legacy:
+            return None
+        return {
+            "type": "kill", "ts": ts_iso,
+            "killer_name": legacy.group("kn").strip(),
+            "killer_steam_id": legacy.group("ks"),
+            "victim_name": legacy.group("vn").strip(),
+            "victim_steam_id": legacy.group("vs"),
+            "weapon": _clean_weapon(legacy.group("w")),
+            "distance_m": float(legacy.group("d")),
+            "raw": body,
+        }
+
+    dist_str = cd or m.group("sd")
+    return {
+        "type": "kill",
+        "ts": ts_iso,
+        "killer_name": m.group("kn").strip(),
+        "killer_steam_id": m.group("ks"),
+        "victim_name": m.group("vn").strip(),
+        "victim_steam_id": m.group("vs"),
+        "weapon": _clean_weapon(m.group("w")),
+        "distance_m": float(dist_str) if dist_str else None,
+        "raw": body,
+    }
+
+
+def _clean_weapon(w: str) -> str:
+    """Turn 'Weapon_M82A1_Black_C [Projectile]' into 'M82A1 Black' for display."""
+    s = (w or "").strip().rstrip(",")
+    # Strip the trailing "[Projectile]" / "[Melee]" tag
+    s = re.sub(r"\s*\[[^\]]*\]\s*$", "", s)
+    # Strip Weapon_ prefix and _C suffix, replace underscores
+    s = re.sub(r"^Weapon_", "", s)
+    s = re.sub(r"_C$", "", s)
+    s = s.replace("_", " ").strip()
+    return s or "Unknown"
+
+
+_TRADE_MAIN_RX = re.compile(
+    r"\[Trade\]\s+Tradeable\s+\(([^(]+)\s*\(x(\d+)\)\)\s+"
+    r"(?P<action>purchased|sold)\s+by\s+(?P<name>[^(]+)\((?P<sid>\d{17})\)\s+"
+    r"(?:for|to)\s+(?P<amt>\d+)\s+money\s+(?:from|to)\s+trader\s+(?P<trader>\S+)",
+    flags=re.IGNORECASE,
+)
+
+# Modern SCUM 1.2+ trade line. Item has no "(xN)" wrapper and uses
+# health/uses stats instead. Example:
+#   [Trade] Tradeable (Boar_Skinned (health: 100.00, uses: 1)) sold by WXSO(76561199169074640)
+#   for 293 (293 + 0 worth of contained items) to trader Z_3_Saloon, old amount in store is 3, new amount is 4
+_TRADE_MODERN_RX = re.compile(
+    r"\[Trade\]\s+Tradeable\s+\((?P<item>[A-Za-z0-9_]+)\s*\([^)]*\)\)\s+"
+    r"(?P<action>purchased|sold)\s+by\s+(?P<name>[^(]+)\((?P<sid>\d{17})\)\s+"
+    r"(?:for|to)\s+(?P<amt>\d+)\s+"
+    r"(?:\([^)]*\)\s+)?"
+    r"(?:from|to)\s+trader\s+(?P<trader>[A-Za-z0-9_]+)",
+    flags=re.IGNORECASE,
+)
+
+# "[Trade] Before ... player NAME(SID) had C cash, B account balance and G gold and trader had F funds."
+# "[Trade] After ...  player NAME(SID) has  C cash, B account balance and G gold and trader has  F funds."
+# SCUM 1.2+ sometimes says "bank account balance" after a purchase instead of
+# "account balance" — both spellings match here.
+# Emits a `balance_snapshot` event so the UI can show live cash/bank/gold
+# without querying SCUM.db.
+_TRADE_BALANCE_RX = re.compile(
+    r"\[Trade\]\s+(?P<phase>Before|After)\b.*?"
+    r"player\s+(?P<name>[^(]+)\((?P<sid>\d{17})\)\s+"
+    r"(?:had|has)\s+(?P<cash>-?\d+)\s+cash\s*,\s*"
+    r"(?P<bal>-?\d+)\s+(?:bank\s+)?account\s+balance\s+and\s+(?P<gold>-?\d+)\s+gold\s+"
+    r"and\s+trader\s+(?:had|has)\s+(?P<funds>-?\d+)\s+funds",
+    flags=re.IGNORECASE,
+)
+
+# "[Bank] NAME(ID:SID)(Account Number:N) purchased Gold card ..., new account balance is X credits, at X=..."
+# "[Bank] NAME(ID:SID)(Account Number:N) deposited/withdrew N ... new account balance is X credits ..."
+_BANK_RX = re.compile(
+    r"\[Bank\]\s+(?P<name>[^(]+)\(ID:(?P<sid>\d{17})\)"
+    r"(?:\(Account\s+Number:(?P<acct>\d+)\))?\s+"
+    r"(?P<action>[a-z][a-z ]+?)\s+"
+    r"(?P<detail>.*?),?\s+new\s+account\s+balance\s+is\s+(?P<bal>-?\d+)\s+credits",
+    flags=re.IGNORECASE,
+)
+
+# "[Bank] NAME(ID:SID)(Account Number:N) deposited 293(287 was added) to Account Number: 719606009702(WXSO)(76561199169074640) at X=..."
+# This variant has NO "new account balance" suffix — SCUM only writes the delta.
+# We still emit a `bank` event so admins see every deposit/withdrawal.
+_BANK_DEPOSIT_RX = re.compile(
+    r"\[Bank\]\s+(?P<name>[^(]+)\(ID:(?P<sid>\d{17})\)"
+    r"(?:\(Account\s+Number:(?P<acct>\d+)\))?\s+"
+    r"(?P<action>deposited|withdrew|withdrawn)\s+"
+    r"(?P<gross>\d+)"
+    r"(?:\((?P<net>\d+)\s+was\s+(?:added|removed|deducted)\))?"
+    r"(?:\s+to\s+Account\s+Number:\s*(?P<target_acct>\d+))?",
+    flags=re.IGNORECASE,
+)
+
+# "[Currency Conversion] NAME(ID:SID)(Account Number:N) purchased 1 gold for 1000 credits (new account balance is 1 gold/7978 credits) at X=..."
+# "[Currency Conversion] NAME(ID:SID)(Account Number:N) sold 1 gold for 1000 credits (new account balance is 0 gold/8978 credits) at X=..."
+# Emits both a `currency_conversion` event AND a `balance_snapshot` so the
+# aggregator picks up the new gold + credits balance even when no trade
+# happens afterwards.
+_CURRENCY_CONV_RX = re.compile(
+    r"\[Currency\s+Conversion\]\s+(?P<name>[^(]+)\(ID:(?P<sid>\d{17})\)"
+    r"(?:\(Account\s+Number:(?P<acct>\d+)\))?\s+"
+    r"(?P<action>purchased|sold|exchanged)\s+"
+    r"(?P<g_qty>\d+)\s+gold\s+(?:for|to)\s+(?P<c_qty>\d+)\s+credits\s*"
+    r"\(new\s+account\s+balance\s+is\s+(?P<new_gold>-?\d+)\s+gold\s*/\s*(?P<new_cred>-?\d+)\s+credits\)",
+    flags=re.IGNORECASE,
+)
+
+
+def parse_economy_line(ts_iso: str, body: str) -> Optional[Dict[str, Any]]:
+    # --- [Currency Conversion] lines (gold <-> credits) ---
+    if body.startswith("[Currency Conversion]"):
+        cm = _CURRENCY_CONV_RX.search(body)
+        if cm:
+            return {
+                "type": "currency_conversion",
+                "ts": ts_iso,
+                "action": cm.group("action").lower(),
+                "gold_qty": int(cm.group("g_qty")),
+                "credit_qty": int(cm.group("c_qty")),
+                "gold": int(cm.group("new_gold")),            # NEW gold balance
+                "account_balance": int(cm.group("new_cred")),  # NEW credits balance
+                "account_number": cm.group("acct"),
+                "player_name": cm.group("name").strip(),
+                "steam_id": cm.group("sid"),
+                # Aggregator reads balance_snapshot to determine live wallet;
+                # duplicate the new totals under that type so the snapshot
+                # pipeline picks this up too.
+                "is_balance_update": True,
+                "raw": body,
+            }
+        return None
+
+    # --- [Bank] lines (Gold card purchase, deposit, withdrawal, etc.) ---
+    if body.startswith("[Bank]"):
+        # 1) Variant with "new account balance is X credits"
+        bm = _BANK_RX.search(body)
+        if bm:
+            return {
+                "type": "bank",
+                "ts": ts_iso,
+                "action": bm.group("action").strip().lower(),
+                "detail": (bm.group("detail") or "").strip().rstrip(","),
+                "account_balance": int(bm.group("bal")),
+                "account_number": bm.group("acct"),
+                "player_name": bm.group("name").strip(),
+                "steam_id": bm.group("sid"),
+                "raw": body,
+            }
+        # 2) Deposit/withdraw WITHOUT a new-balance trailer — SCUM only writes
+        #    the delta. We still record the event but account_balance stays None.
+        dm = _BANK_DEPOSIT_RX.search(body)
+        if dm:
+            gross = int(dm.group("gross"))
+            net = int(dm.group("net")) if dm.group("net") else gross
+            return {
+                "type": "bank",
+                "ts": ts_iso,
+                "action": dm.group("action").lower(),
+                "gross_amount": gross,
+                "net_amount": net,  # what actually landed in the account after bank fee
+                "fee": gross - net,
+                "account_number": dm.group("acct"),
+                "target_account_number": dm.group("target_acct"),
+                "player_name": dm.group("name").strip(),
+                "steam_id": dm.group("sid"),
+                "raw": body,
+            }
+        # Unknown [Bank] format — fall through to generic so the raw text is kept.
+        return None
+
+    if not body.startswith("[Trade]"):
+        return None
+
+    # Parse Before/After balance snapshots — gives us live cash/bank/gold
+    # per player with zero SCUM.db reads.
+    if body.startswith("[Trade] Before ") or body.startswith("[Trade] After "):
+        bm = _TRADE_BALANCE_RX.search(body)
+        if bm:
+            return {
+                "type": "balance_snapshot",
+                "ts": ts_iso,
+                "phase": bm.group("phase").lower(),
+                "cash": int(bm.group("cash")),
+                "account_balance": int(bm.group("bal")),
+                "gold": int(bm.group("gold")),
+                "trader_funds": int(bm.group("funds")),
+                "player_name": bm.group("name").strip(),
+                "steam_id": bm.group("sid"),
+                "raw": body,
+            }
+        # If it didn't match the balance line regex, skip entirely — these
+        # are companion lines and shouldn't be stored as generic.
+        return {"_skip": True}
+
+    # Try modern SCUM 1.2+ format first; fall back to legacy "money" format.
+    m_mod = _TRADE_MODERN_RX.search(body)
+    if m_mod:
+        g = m_mod.groupdict()
+        return {
+            "type": "economy",
+            "ts": ts_iso,
+            "action": g["action"].lower(),
+            "item_code": g["item"].strip(),
+            "quantity": 1,  # modern log encodes stack via "uses", not count
+            "amount": int(g["amt"]),
+            "currency": "money",
+            "trader": g["trader"].rstrip(",."),
+            "player_name": g["name"].strip(),
+            "steam_id": g["sid"],
+            "raw": body,
+        }
+    m = _TRADE_MAIN_RX.search(body)
+    if not m:
+        return None
+    return {
+        "type": "economy",
+        "ts": ts_iso,
+        "action": m.group("action").lower(),
+        "item_code": m.group(1).strip(),
+        "quantity": int(m.group(2)),
+        "amount": int(m.group("amt")),
+        "currency": "money",
+        "trader": m.group("trader").rstrip(",."),
+        "player_name": m.group("name").strip(),
+        "steam_id": m.group("sid"),
+        "raw": body,
+    }
+
+
+def parse_violations_line(ts_iso: str, body: str) -> Optional[Dict[str, Any]]:
+    w = _WHO_RX.search(body)
+    return {
+        "type": "violation",
+        "ts": ts_iso,
+        "steam_id": w.group(1) if w else None,
+        "player_name": w.group(2) if w else None,
+        "entity_id": int(w.group(3)) if w else None,
+        "description": body,
+        "raw": body,
+    }
+
+
+def parse_fame_line(ts_iso: str, body: str) -> Optional[Dict[str, Any]]:
+    """Parse SCUM fame/famepoints log. Multiple formats exist across patches:
+
+    Modern (1.x):  "'SID:Name(ID)' gained '5.00' fame for 'Surviving'"
+    Alt (older):   "Name (SID) gained 5 fame"
+    JSON-style:    '{"PlayerName":"X","UserId":"SID","FamePoints":5.00,"Reason":"..."}'
+    """
+    # --- JSON variant ---
+    if body.lstrip().startswith("{"):
+        try:
+            obj = json.loads(body)
+            sid = obj.get("UserId") or obj.get("SteamId") or obj.get("steam_id")
+            if not sid:
+                return None
+            return {
+                "type": "fame", "ts": ts_iso,
+                "player_name": obj.get("PlayerName") or obj.get("ProfileName") or obj.get("name"),
+                "steam_id": str(sid),
+                "delta": float(obj.get("FamePoints") or obj.get("Delta") or obj.get("Points") or 0),
+                "reason": obj.get("Reason") or obj.get("Description"),
+                "raw": body,
+            }
+        except Exception:
+            pass
+
+    # --- Modern: 'SID:Name(ID)' gained/lost 'N.NN' fame for 'Reason' ---
+    m = re.search(
+        r"'(?P<sid>\d{17}):(?P<name>[^(]+)\(\d+\)'\s+"
+        r"(?P<act>gained|lost|awarded|deducted|received)\s+'?(?P<amt>-?[0-9.]+)'?\s+"
+        r"(?:fame\s*(?:points?)?|points?)\s+"
+        r"(?:for\s+'(?P<reason>[^']+)')?",
+        body, flags=re.IGNORECASE,
+    )
+    if m:
+        amt = float(m.group("amt"))
+        if m.group("act").lower() in ("lost", "deducted"):
+            amt = -abs(amt)
+        return {
+            "type": "fame", "ts": ts_iso,
+            "player_name": m.group("name").strip(),
+            "steam_id": m.group("sid"),
+            "delta": amt,
+            "reason": (m.group("reason") or "").strip() or None,
+            "raw": body,
+        }
+
+    # --- Legacy: Name (SID) gained 5 fame ---
+    m = re.search(
+        r"(?P<name>[^(]+)\((?P<sid>\d{17})\).*?"
+        r"(?P<act>gained|lost|awarded|deducted|received)\s+(?P<amt>-?[0-9.]+)\s+fame",
+        body, flags=re.IGNORECASE,
+    )
+    if not m:
+        return None
+    amt = float(m.group("amt"))
+    if m.group("act").lower() in ("lost", "deducted"):
+        amt = -abs(amt)
+    return {
+        "type": "fame", "ts": ts_iso,
+        "player_name": m.group("name").strip(),
+        "steam_id": m.group("sid"),
+        "delta": amt,
+        "raw": body,
+    }
+
+
+def parse_vehicle_destruction_line(ts_iso: str, body: str) -> Optional[Dict[str, Any]]:
+    """Parse vehicle_destruction_*.log lines. Real SCUM format (1.2+):
+
+        [Destroyed] Rager_ES. VehicleId: 70028. Owner: N/A. Location: X=... Y=... Z=...
+        [Entity destroyed] Kinglet_Mariner_ES. VehicleId: 70704. Owner: N/A. Location: ...
+
+    Older/alt variant with explicit Killer is also handled:
+
+        [VehicleDestroyed] Vehicle: BP_LandVehicle_X_C (VehicleId=...), Owner: SID (N), DestroyedBy: SID (N), Reason: X
+
+    The newer format doesn't include a destroyer (most kills are environmental
+    damage / entity timeout), so we populate what's available.
+    """
+    if body.lstrip().startswith("{"):
+        return {"_skip": True}
+
+    # --- NEW FORMAT (1.2+) ---
+    # [Destroyed] Rager_ES. VehicleId: 70028. Owner: N/A. Location: X=1 Y=2 Z=3
+    m = re.match(
+        r"\[(?P<kind>Destroyed|Entity destroyed|VehicleDestroyed)\]\s+"
+        r"(?P<klass>[A-Za-z0-9_]+)\.\s*"
+        r"VehicleId:\s*(?P<vid>\d+)\.\s*"
+        r"Owner:\s*(?P<owner>[^.]+?)\.\s*"
+        r"Location:\s*X=(?P<x>-?[0-9.]+)\s+Y=(?P<y>-?[0-9.]+)\s+Z=(?P<z>-?[0-9.]+)",
+        body,
+    )
+    if m:
+        owner_raw = m.group("owner").strip()
+        # Owner can be "N/A", "76561199... (Gabriel)", or just "Gabriel"
+        owner_sid: Optional[str] = None
+        owner_name: Optional[str] = None
+        if owner_raw and owner_raw.upper() != "N/A":
+            sidm = re.search(r"(\d{17})\s*(?:\(([^)]+)\))?", owner_raw)
+            if sidm:
+                owner_sid = sidm.group(1)
+                owner_name = (sidm.group(2) or "").strip() or None
+            else:
+                owner_name = owner_raw
+        klass = m.group("klass")
+        pretty = re.sub(r"^BP_(?:Land|Sea|Air)?Vehicle_", "", klass)
+        pretty = re.sub(r"_C$", "", pretty).replace("_", " ").strip() or klass
+        entity_only = m.group("kind").lower().startswith("entity")
+        return {
+            "type": "vehicle_destruction",
+            "ts": ts_iso,
+            "vehicle_class": klass,
+            "vehicle_pretty": pretty,
+            "vehicle_id": int(m.group("vid")),
+            "owner_steam_id": owner_sid,
+            "owner_name": owner_name,
+            "killer_steam_id": None,
+            "killer_name": None,
+            "reason": "EntityTimeout" if entity_only else "Destroyed",
+            "location": {"x": float(m.group("x")), "y": float(m.group("y")), "z": float(m.group("z"))},
+            "steam_id": owner_sid,
+            "player_name": owner_name,
+            "raw": body,
+        }
+
+    # --- OLDER / ALT FORMAT with explicit Killer ---
+    vm = re.search(r"Vehicle:\s*([A-Za-z0-9_]+)", body)
+    veh_class = vm.group(1) if vm else None
+
+    def _pair(tag: str) -> Tuple[Optional[str], Optional[str]]:
+        mm = re.search(
+            rf"{tag}:\s*(?:(\d{{17}})\s*\(([^)]+)\)|([^\s(]+)\s*\((\d{{17}})\))",
+            body, flags=re.IGNORECASE,
+        )
+        if not mm:
+            return (None, None)
+        if mm.group(1):
+            return (mm.group(1), mm.group(2).strip())
+        return (mm.group(4), mm.group(3).strip())
+
+    owner_sid, owner_name = _pair("Owner")
+    killer_sid, killer_name = _pair("(?:DestroyedBy|Destroyer|Killer)")
+
+    reason = None
+    rm = re.search(r"Reason:\s*([A-Za-z_]+)", body)
+    if rm:
+        reason = rm.group(1)
+
+    if not veh_class and not owner_sid and not killer_sid:
+        return None
+
+    pretty = None
+    if veh_class:
+        pretty = re.sub(r"^BP_(?:Land|Sea|Air)?Vehicle_", "", veh_class)
+        pretty = re.sub(r"_C$", "", pretty).replace("_", " ").strip()
+
+    return {
+        "type": "vehicle_destruction",
+        "ts": ts_iso,
+        "vehicle_class": veh_class,
+        "vehicle_pretty": pretty or veh_class,
+        "owner_steam_id": owner_sid,
+        "owner_name": owner_name,
+        "killer_steam_id": killer_sid,
+        "killer_name": killer_name,
+        "reason": reason,
+        "steam_id": owner_sid,
+        "player_name": owner_name,
+        "raw": body,
+    }
+
+
+def parse_lockpicking_line(ts_iso: str, body: str) -> Optional[Dict[str, Any]]:
+    # '76561199...:WXSO(1)' failed to pick a lock on 'BP_Door_Metal_Large_C_0'
+    # '76561199...:WXSO(1)' successfully picked a lock on 'BP_Door_Metal_Large_C_0'
+    m = re.search(
+        r"'(?P<who>[^']+)'\s+(?P<action>failed to pick|successfully picked)\s+a?\s*lock\s+on\s+'(?P<target>[^']+)'",
+        body, flags=re.IGNORECASE
+    )
+    if not m:
+        return None
+    w = _WHO_RX.search(m.group("who"))
+    action = "success" if "success" in m.group("action").lower() else "fail"
+    target = m.group("target")
+    target_pretty = target.replace("BP_", "").replace("_C", "").replace("_", " ").strip()
+    return {
+        "type": "lockpicking",
+        "ts": ts_iso,
+        "action": action,
+        "target_name": target,
+        "target_pretty": target_pretty,
+        "steam_id": w.group(1) if w else None,
+        "player_name": w.group(2) if w else None,
+        "entity_id": int(w.group(3)) if w else None,
+        "raw": body,
+    }
+
+
+def parse_mine_trigger_line(ts_iso: str, body: str) -> Optional[Dict[str, Any]]:
+    # '76561199...:WXSO(1)' triggered mine 'BP_Mine_C_0' at location X=... Y=... Z=...
+    m = re.search(
+        r"'(?P<who>[^']+)'\s+(?P<action>triggered|detonated)\s+mine\s+'(?P<target>[^']+)'"
+        r"(?:\s+at\s+location\s*X=(?P<x>-?[\d.]+)\s+Y=(?P<y>-?[\d.]+)\s+Z=(?P<z>-?[\d.]+))?",
+        body, flags=re.IGNORECASE
+    )
+    if not m:
+        return None
+    w = _WHO_RX.search(m.group("who"))
+    target = m.group("target")
+    target_pretty = target.replace("BP_", "").replace("_C", "").replace("_", " ").strip()
+    loc = None
+    if m.group("x") is not None:
+        loc = {"x": float(m.group("x")), "y": float(m.group("y")), "z": float(m.group("z"))}
+    return {
+        "type": "mine_trigger",
+        "ts": ts_iso,
+        "target_name": target,
+        "target_pretty": target_pretty,
+        "location": loc,
+        "steam_id": w.group(1) if w else None,
+        "player_name": w.group(2) if w else None,
+        "entity_id": int(w.group(3)) if w else None,
+        "raw": body,
+    }
+
+
+def parse_chest_ownership_line(ts_iso: str, body: str) -> Optional[Dict[str, Any]]:
+    # '76561199...:WXSO(1)' opened/claimed chest 'BP_Base_Chest_C_0'
+    m = re.search(
+        r"'(?P<who>[^']+)'\s+(?P<action>opened|claimed|unlocked|locked)\s+chest\s+'(?P<target>[^']+)'",
+        body, flags=re.IGNORECASE
+    )
+    if not m:
+        return None
+    w = _WHO_RX.search(m.group("who"))
+    target = m.group("target")
+    target_pretty = target.replace("BP_", "").replace("_C", "").replace("_", " ").strip()
+    return {
+        "type": "chest_ownership",
+        "ts": ts_iso,
+        "action": m.group("action").lower(),
+        "target_name": target,
+        "target_pretty": target_pretty,
+        "steam_id": w.group(1) if w else None,
+        "player_name": w.group(2) if w else None,
+        "entity_id": int(w.group(3)) if w else None,
+        "raw": body,
+    }
+
+
+def parse_destruction_line(ts_iso: str, body: str) -> Optional[Dict[str, Any]]:
+    # '76561199...:WXSO(1)' destroyed base element 'BP_WoodWall_C_0'
+    # or Base element 'BP_WoodWall_C_0' destroyed by '76561199...:WXSO(1)'
+    m = re.search(
+        r"'(?P<who>[^']+)'\s+destroyed\s+(?:base\s+element\s+)?'(?P<target>[^']+)'",
+        body, flags=re.IGNORECASE
+    )
+    if not m:
+        m = re.search(
+            r"(?:base\s+element\s+)?'(?P<target>[^']+)'\s+destroyed\s+by\s+'(?P<who>[^']+)'",
+            body, flags=re.IGNORECASE
+        )
+    if not m:
+        return None
+    w = _WHO_RX.search(m.group("who"))
+    target = m.group("target")
+    target_pretty = target.replace("BP_", "").replace("_C", "").replace("_", " ").strip()
+    return {
+        "type": "destruction",
+        "ts": ts_iso,
+        "target_name": target,
+        "target_pretty": target_pretty,
+        "steam_id": w.group(1) if w else None,
+        "player_name": w.group(2) if w else None,
+        "entity_id": int(w.group(3)) if w else None,
+        "raw": body,
+    }
+
+
+def parse_generic_line(ts_iso: str, body: str, log_type: str) -> Optional[Dict[str, Any]]:
+    """Fallback parser for log types that have no dedicated parser.
+
+    Noise is already filtered by _is_noise_line() before this is called, so
+    this function only needs to extract the player identity (if present) and
+    return the raw body.  Returns None only for truly unrecognisable lines
+    that carry no useful information (no player ID, no meaningful text).
+    """
+    w = _WHO_RX.search(body)
+    # Skip lines with no player and no recognisable content (pure engine chatter
+    # that slipped through the prefix filter).
+    if not w and len(body.strip()) < 10:
+        return None
+    return {
+        "type": log_type,
+        "ts": ts_iso,
+        "steam_id": w.group(1) if w else None,
+        "player_name": w.group(2) if w else None,
+        "entity_id": int(w.group(3)) if w else None,
+        "raw": body,
+    }
+
+
+# ----- dispatch -----------------------------------------------------------
+
+LOG_TYPE_ORDER = [
+    "admin", "chat", "login", "kill", "economy", "violation", "fame", "raid",
+    "armor_absorption", "chest_ownership", "event_kill", "quest", "lockpicking",
+    "destruction", "vehicle_destruction", "mine_trigger", "generic",
+]
+
+
+def detect_log_type(filename: str) -> str:
+    base = Path(filename).name.lower()
+    # strip trailing _YYYYMMDDHHMMSS.log
+    base = re.sub(r"_\d{14}\.log$", "", base)
+    base = re.sub(r"\.log$", "", base)
+    mapping = {
+        "admin": "admin",
+        "chat": "chat",
+        "login": "login",
+        "kill": "kill",
+        "economy": "economy",
+        "violations": "violation",
+        "famepoints": "fame",
+        "fame": "fame",
+        "raid_protection": "raid",
+        "raid": "raid",
+        "armor_absorption": "armor_absorption",
+        "chest_ownership": "chest_ownership",
+        "event_kill": "event_kill",
+        "quest": "quest",
+        "lockpicking": "lockpicking",
+        "destruction": "destruction",
+        "vehicle_destruction": "vehicle_destruction",
+        "mine_trigger": "mine_trigger",
+    }
+    return mapping.get(base, "generic")
+
+
+def _parser_for(log_type: str):
+    return {
+        "admin": parse_admin_line,
+        "chat": parse_chat_line,
+        "login": parse_login_line,
+        "kill": parse_kill_line,
+        "economy": parse_economy_line,
+        "violation": parse_violations_line,
+        "fame": parse_fame_line,
+        "vehicle_destruction": parse_vehicle_destruction_line,
+        "lockpicking": parse_lockpicking_line,
+        "mine_trigger": parse_mine_trigger_line,
+        "chest_ownership": parse_chest_ownership_line,
+        "destruction": parse_destruction_line,
+    }.get(log_type)
+
+
+# Pattern that recognizes the multi-line periodic fame award emitted by
+# SCUM 1.x on an interval (default ~10 min). Real format:
+#   2026.04.23-12.14.13: ---------------------------------
+#   Player WXSO(76561199169074640) was awarded 97.861374 fame points in 10 minutes for a total of 100.040031
+#   DistanceTraveledOnFoot: 0.000547
+#   BaseFameInflux: 0.690184
+#   ...
+#   ---------------------------------
+# The first (and only) timestamped line is the dash separator; the actual
+# content follows on untimestamped lines. `parse_log_text` normally drops
+# untimestamped lines entirely, so we preprocess the whole text for fame
+# logs before the regular line loop runs.
+_FAME_AWARD_BLOCK_RX = re.compile(
+    r"Player\s+(?P<name>[^(]+)\((?P<sid>\d{17})\)\s+was\s+awarded\s+"
+    r"(?P<amt>-?\d+(?:\.\d+)?)\s+fame\s+points\s+"
+    r"(?:in\s+(?P<window>[^\s]+)\s+minutes?\s+)?"
+    r"for\s+a\s+total\s+of\s+(?P<total>-?\d+(?:\.\d+)?)",
+    flags=re.IGNORECASE,
+)
+
+
+def _extract_fame_awards(text: str) -> List[Dict[str, Any]]:
+    """Walk the fame log as blocks and pull every 'was awarded N fame points' event.
+    Timestamps come from the enclosing separator line; breakdown lines are
+    attached verbatim as a `breakdown` dict."""
+    lines = text.splitlines()
+    events: List[Dict[str, Any]] = []
+    current_ts: Optional[str] = None
+    block: List[str] = []
+
+    def flush():
+        nonlocal block
+        if not block:
+            return
+        blob = "\n".join(block)
+        m = _FAME_AWARD_BLOCK_RX.search(blob)
+        block = []
+        if not m or not current_ts:
+            return
+        amt = float(m.group("amt"))
+        # Extract per-reason contributions (Reason: value per line)
+        breakdown: Dict[str, float] = {}
+        for ln in blob.splitlines():
+            bm = re.match(r"\s*([A-Za-z][A-Za-z0-9_]*)\s*:\s*(-?\d+(?:\.\d+)?)\s*$", ln)
+            if bm and bm.group(1).lower() not in ("game", "player", "time"):
+                try:
+                    breakdown[bm.group(1)] = float(bm.group(2))
+                except ValueError:
+                    pass
+        events.append({
+            "type": "fame", "ts": current_ts,
+            "player_name": m.group("name").strip(),
+            "steam_id": m.group("sid"),
+            "delta": amt,
+            "total": float(m.group("total")),
+            "window_minutes": m.group("window"),
+            "reason": "periodic_award",
+            "breakdown": breakdown or None,
+            "raw": blob,
+        })
+
+    for raw in lines:
+        line = raw.strip().lstrip("\ufeff")
+        if not line:
+            continue
+        tm = _LINE_RX.match(line)
+        if tm:
+            # New timestamped line -> flush any accumulated block
+            flush()
+            body = tm.group(2)
+            if body.startswith("Game version"):
+                current_ts = None
+                continue
+            current_ts = _parse_ts(tm.group(1)) or datetime.now(timezone.utc).isoformat()
+            # If the timestamped line itself contains the award line, treat it
+            # as a 1-line block; else start a new block with it.
+            if "was awarded" in body and "fame" in body:
+                block = [body]
+                flush()
+            elif body.startswith("---"):
+                # separator — block boundary only
+                block = []
+            else:
+                block = [body]
+        else:
+            # Untimestamped continuation — only meaningful if we've seen a timestamp
+            if current_ts:
+                if line.startswith("---"):
+                    flush()
+                else:
+                    block.append(line)
+    flush()
+    return events
+
+
+def parse_log_text(text: str, log_type: str, *, filename: str = "", server_id: str = "") -> List[Dict[str, Any]]:
+    """Parse a full log file's text content. Skips the 'Game version' header and blank lines."""
+    # Fame log uses multi-line blocks separated by dashes — handle it with a
+    # dedicated text-level walker. Single-line legacy fame lines (other SCUM
+    # patches) still work because `parse_fame_line` is applied to any line
+    # that doesn't fit the new block format below.
+    if log_type == "fame":
+        events = _extract_fame_awards(text)
+        if events:
+            for ev in events:
+                ev["server_id"] = server_id
+                ev["source_file"] = Path(filename).name if filename else ""
+                ev["id"] = _event_id(server_id, ev["ts"], ev["raw"][:200])
+            return events
+        # Fall through to line-by-line parsing below — handles legacy fame
+        # log formats (single-line "gained X fame").
+
+    parser = _parser_for(log_type)
+    events: List[Dict[str, Any]] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip().lstrip("\ufeff")
+        if not line:
+            continue
+        m = _LINE_RX.match(line)
+        if not m:
+            continue
+        ts_str, body = m.group(1), m.group(2)
+        # ── Drop all Unreal Engine / SCUM startup noise ────────────────────
+        # _is_noise_line() covers "Game version:", LogInit:, "Log: initializing",
+        # day/night cycle stats, and every other known garbage line category.
+        if _is_noise_line(body):
+            continue
+        ts_iso = _parse_ts(ts_str) or datetime.now(timezone.utc).isoformat()
+        ev: Optional[Dict[str, Any]] = None
+        if parser:
+            try:
+                ev = parser(ts_iso, body)
+            except Exception:
+                ev = None
+        if ev is not None and ev.get("_skip"):
+            continue
+        if ev is None:
+            ev = parse_generic_line(ts_iso, body, log_type)
+        if ev is None:
+            continue
+        ev["server_id"] = server_id
+        ev["source_file"] = Path(filename).name if filename else ""
+        # Deterministic id: server + timestamp + full body text.
+        # We intentionally DROP source_file from the hash input — SCUM rotates log
+        # files and can re-write the same login snapshot into a new file name,
+        # which previously produced duplicate events (and duplicate Discord pings).
+        ev["id"] = _event_id(server_id, ts_iso, body)
+        events.append(ev)
+    return events
+
+
+def parse_log_file(path: str | Path, *, server_id: str = "") -> Tuple[str, List[Dict[str, Any]]]:
+    text = read_log_file(path)
+    log_type = detect_log_type(str(path))
+    return log_type, parse_log_text(text, log_type, filename=str(path), server_id=server_id)

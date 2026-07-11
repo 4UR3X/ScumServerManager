@@ -1,0 +1,1107 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================
+   LGSS · TACTICAL COMMAND DESIGN SYSTEM
+   Typography: Rajdhani (display/military) + IBM Plex Sans (body) + JetBrains Mono (data)
+   ============================================================ */
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+:root {
+  --font-display: 'Plus Jakarta Sans', sans-serif;
+  --font-sans: 'Plus Jakarta Sans', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+}
+
+/* ========== THEME: BUNKER (default) — concrete + rust + amber ========== */
+[data-theme="bunker"] {
+  --bg: #141414;
+  --bg-deep: #0A0A0A;
+  --surface: #1E1E1E;
+  --surface-2: #262626;
+  --surface-3: #333333;
+  --glass: rgba(30, 30, 30, 0.80);
+  --primary: #D4A373;
+  --primary-hover: #E3B888;
+  --primary-active: #B88A5E;
+  --primary-soft: rgba(212, 163, 115, 0.10);
+  --accent: #E65100;
+  --accent-hover: #FB6D1E;
+  --accent-soft: rgba(230, 81, 0, 0.10);
+  --border: #333333;
+  --border-strong: #4A4A4A;
+  --border-focus: #E65100;
+  --text: #F5F5F5;
+  --text-dim: #A3A3A3;
+  --text-muted: #707070;
+  --success: #81C784;
+  --danger: #B71C1C;
+  --danger-hover: #C62828;
+  --warning: #FFA726;
+  --info: #4FC3F7;
+}
+
+/* ========== THEME: NEON GRID — cyberpunk magenta+cyan ========== */
+[data-theme="neon-grid"] {
+  --bg: #0A0314;
+  --bg-deep: #050108;
+  --surface: #14072A;
+  --surface-2: #1F0F3D;
+  --surface-3: #2C1A52;
+  --glass: rgba(20, 7, 42, 0.85);
+  --primary: #FF2DD1;
+  --primary-hover: #FF66E0;
+  --primary-active: #DB1AB0;
+  --primary-soft: rgba(255, 45, 209, 0.12);
+  --accent: #00E5FF;
+  --accent-hover: #66F1FF;
+  --accent-soft: rgba(0, 229, 255, 0.10);
+  --border: #2A124D;
+  --border-strong: #421C73;
+  --border-focus: #FF2DD1;
+  --text: #F5E9FF;
+  --text-dim: #B796CF;
+  --text-muted: #765490;
+  --success: #4CFFB3;
+  --danger: #FF3D7F;
+  --danger-hover: #FF6398;
+  --warning: #FFD64C;
+  --info: #00E5FF;
+}
+
+/* ========== THEME: CARBON — graphite + amber accent ========== */
+[data-theme="carbon"] {
+  --bg: #0E0E10;
+  --bg-deep: #070708;
+  --surface: #161618;
+  --surface-2: #1F1F22;
+  --surface-3: #2A2A2E;
+  --glass: rgba(22, 22, 24, 0.85);
+  --primary: #FFB627;
+  --primary-hover: #FFC957;
+  --primary-active: #E69B14;
+  --primary-soft: rgba(255, 182, 39, 0.10);
+  --accent: #FFB627;
+  --accent-hover: #FFC957;
+  --accent-soft: rgba(255, 182, 39, 0.08);
+  --border: #26262A;
+  --border-strong: #353539;
+  --border-focus: #FFB627;
+  --text: #ECECEE;
+  --text-dim: #92929A;
+  --text-muted: #5F5F66;
+  --success: #94D682;
+  --danger: #EE6155;
+  --danger-hover: #F37D72;
+  --warning: #FFB627;
+  --info: #7FB4E0;
+}
+
+/* ========== THEME: TOXIC — radioactive lime on swamp ========== */
+[data-theme="toxic"] {
+  --bg: #07120A;
+  --bg-deep: #030906;
+  --surface: #0B1A0E;
+  --surface-2: #112815;
+  --surface-3: #19381F;
+  --glass: rgba(11, 26, 14, 0.85);
+  --primary: #B6FF00;
+  --primary-hover: #C8FF3D;
+  --primary-active: #95D900;
+  --primary-soft: rgba(182, 255, 0, 0.10);
+  --accent: #B6FF00;
+  --accent-hover: #C8FF3D;
+  --accent-soft: rgba(182, 255, 0, 0.10);
+  --border: #1C3322;
+  --border-strong: #2A4A34;
+  --border-focus: #B6FF00;
+  --text: #E8FFD4;
+  --text-dim: #8FB880;
+  --text-muted: #587553;
+  --success: #B6FF00;
+  --danger: #FF5252;
+  --danger-hover: #FF7474;
+  --warning: #FFEA00;
+  --info: #54FFB7;
+}
+
+/* ========== THEME: INFERNO — pure fire red on charcoal ========== */
+[data-theme="inferno"] {
+  --bg: #110504;
+  --bg-deep: #080201;
+  --surface: #1B0908;
+  --surface-2: #2A0F0D;
+  --surface-3: #3D1714;
+  --glass: rgba(27, 9, 8, 0.88);
+  --primary: #FF3B1F;
+  --primary-hover: #FF6242;
+  --primary-active: #DB2308;
+  --primary-soft: rgba(255, 59, 31, 0.12);
+  --accent: #FF3B1F;
+  --accent-hover: #FF6242;
+  --accent-soft: rgba(255, 59, 31, 0.12);
+  --border: #3A1612;
+  --border-strong: #54211C;
+  --border-focus: #FF3B1F;
+  --text: #FFE5DD;
+  --text-dim: #C8918A;
+  --text-muted: #8A5C56;
+  --success: #FFA000;
+  --danger: #FF1744;
+  --danger-hover: #FF4366;
+  --warning: #FFAB00;
+  --info: #FFAB91;
+}
+
+/* ========== THEME: ARCTIC STORM — ice white + glacier blue ========== */
+[data-theme="arctic-storm"] {
+  --bg: #050B14;
+  --bg-deep: #02060D;
+  --surface: #0B1626;
+  --surface-2: #142238;
+  --surface-3: #1F324E;
+  --glass: rgba(11, 22, 38, 0.82);
+  --primary: #E0F2FF;
+  --primary-hover: #F4FAFF;
+  --primary-active: #B8DDF5;
+  --primary-soft: rgba(224, 242, 255, 0.10);
+  --accent: #7DD3FC;
+  --accent-hover: #A9E1FD;
+  --accent-soft: rgba(125, 211, 252, 0.12);
+  --border: #1A2C46;
+  --border-strong: #28406A;
+  --border-focus: #7DD3FC;
+  --text: #F0F8FF;
+  --text-dim: #8AAACC;
+  --text-muted: #57708F;
+  --success: #5EEAD4;
+  --danger: #F87171;
+  --danger-hover: #FB8989;
+  --warning: #FCD34D;
+  --info: #7DD3FC;
+}
+
+/* ========== THEME: ROYAL — black + gold + crimson ========== */
+[data-theme="royal"] {
+  --bg: #0A0A0A;
+  --bg-deep: #050505;
+  --surface: #141414;
+  --surface-2: #1E1A12;
+  --surface-3: #2A2418;
+  --glass: rgba(20, 20, 20, 0.88);
+  --primary: #D4AF37;
+  --primary-hover: #E8C254;
+  --primary-active: #B8941E;
+  --primary-soft: rgba(212, 175, 55, 0.12);
+  --accent: #D4AF37;
+  --accent-hover: #E8C254;
+  --accent-soft: rgba(212, 175, 55, 0.10);
+  --border: #2A2418;
+  --border-strong: #3D3422;
+  --border-focus: #D4AF37;
+  --text: #F5ECCC;
+  --text-dim: #BFA875;
+  --text-muted: #7A6B47;
+  --success: #88CC44;
+  --danger: #8B0000;
+  --danger-hover: #A11414;
+  --warning: #D4AF37;
+  --info: #C9A876;
+}
+
+/* ========== THEME: SYNTHWAVE — sunset magenta + purple ========== */
+[data-theme="synthwave"] {
+  --bg: #110326;
+  --bg-deep: #080115;
+  --surface: #1B073D;
+  --surface-2: #28115A;
+  --surface-3: #361A77;
+  --glass: rgba(27, 7, 61, 0.85);
+  --primary: #FF4FB8;
+  --primary-hover: #FF7BC9;
+  --primary-active: #E22A98;
+  --primary-soft: rgba(255, 79, 184, 0.12);
+  --accent: #FF4FB8;
+  --accent-hover: #FF7BC9;
+  --accent-soft: rgba(255, 79, 184, 0.12);
+  --border: #2D125C;
+  --border-strong: #3F1D7E;
+  --border-focus: #FF4FB8;
+  --text: #FBE5FF;
+  --text-dim: #C798E0;
+  --text-muted: #8862A8;
+  --success: #45FFE3;
+  --danger: #FF3D7F;
+  --danger-hover: #FF6398;
+  --warning: #FFD24A;
+  --info: #6FB6FF;
+}
+
+/* ========== THEME: VORTEX — cosmic violet + bright cyan glow ========== */
+[data-theme="vortex"] {
+  --bg: #070212;
+  --bg-deep: #030107;
+  --surface: #0E0522;
+  --surface-2: #160B31;
+  --surface-3: #221443;
+  --glass: rgba(14, 5, 34, 0.85);
+  --primary: #00FFCC;
+  --primary-hover: #33FFD6;
+  --primary-active: #00D1A7;
+  --primary-soft: rgba(0, 255, 204, 0.12);
+  --accent: #9D4EDD;
+  --accent-hover: #B5179E;
+  --accent-soft: rgba(157, 78, 221, 0.12);
+  --border: #200D47;
+  --border-strong: #321768;
+  --border-focus: #00FFCC;
+  --text: #F0F4FF;
+  --text-dim: #A89FC4;
+  --text-muted: #6E638D;
+  --success: #2EC4B6;
+  --danger: #FF007F;
+  --danger-hover: #FF3399;
+  --warning: #FFB703;
+  --info: #00FFCC;
+}
+
+/* ========== THEME: OBSIDIAN GLOW — ultra dark carbon + ruby laser glow ========== */
+[data-theme="obsidian"] {
+  --bg: #080808;
+  --bg-deep: #040404;
+  --surface: #121212;
+  --surface-2: #1A1A1A;
+  --surface-3: #242424;
+  --glass: rgba(18, 18, 18, 0.85);
+  --primary: #FF1E27;
+  --primary-hover: #FF4D54;
+  --primary-active: #D6121B;
+  --primary-soft: rgba(255, 30, 39, 0.12);
+  --accent: #E2E8F0;
+  --accent-hover: #FFFFFF;
+  --accent-soft: rgba(226, 232, 240, 0.08);
+  --border: #222222;
+  --border-strong: #333333;
+  --border-focus: #FF1E27;
+  --text: #FFF0F2;
+  --text-dim: #A3A3A3;
+  --text-muted: #5C5C5C;
+  --success: #00FF88;
+  --danger: #FF1E27;
+  --danger-hover: #FF4D54;
+  --warning: #FF9900;
+  --info: #38BDF8;
+}
+
+/* Shadcn token bridge — sharp edges */
+[data-theme] {
+  --background: 0 0% 4%;
+  --foreground: 210 20% 96%;
+  --card: 210 10% 8%;
+  --card-foreground: 210 20% 96%;
+  --popover: 210 10% 8%;
+  --popover-foreground: 210 20% 96%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 210 10% 14%;
+  --secondary-foreground: 210 20% 96%;
+  --muted: 210 10% 14%;
+  --muted-foreground: 210 10% 60%;
+  --accent-foreground: 210 20% 96%;
+  --destructive: 0 62.8% 50%;
+  --destructive-foreground: 0 0% 98%;
+  --input: 210 10% 14%;
+  --ring: 28 100% 50%;
+  --radius: 0;
+}
+
+* { border-color: var(--border); }
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+/* Global grain texture — eliminates digital flatness */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background-image: url("data:image/svg+xml;utf8,<svg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 0.4 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+  opacity: 0.06;
+  mix-blend-mode: overlay;
+  z-index: 1;
+}
+
+/* Tactical scan-line overlay - disabled for modern look */
+.scanlines {
+  position: relative;
+}
+.scanlines::after {
+  display: none !important;
+}
+
+/* Typography utilities */
+.font-mono { font-family: var(--font-mono); }
+.font-display { font-family: var(--font-display); letter-spacing: 0.02em; }
+.heading-stencil {
+  font-family: var(--font-display);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text);
+}
+
+/* Color helpers */
+.bg-bg { background-color: var(--bg); }
+.bg-bg-deep { background-color: var(--bg-deep); }
+.bg-surface { background-color: var(--surface); }
+.bg-surface-2 { background-color: var(--surface-2); }
+.bg-surface-3 { background-color: var(--surface-3); }
+.bg-glass { background-color: var(--glass); backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); }
+.bg-primary-brand { background-color: var(--primary); }
+.bg-primary-soft { background-color: var(--primary-soft); }
+.bg-accent-brand { background-color: var(--accent); }
+.bg-accent-soft { background-color: var(--accent-soft); }
+.text-brand { color: var(--text); }
+.text-dim { color: var(--text-dim); }
+.text-muted { color: var(--text-muted); }
+.text-primary-brand { color: var(--primary); }
+.text-accent-brand { color: var(--accent); }
+.text-success { color: var(--success); }
+.text-danger { color: var(--danger); }
+.text-warning { color: var(--warning); }
+.border-brand { border-color: var(--border); }
+.border-strong { border-color: var(--border-strong); }
+.border-primary-brand { border-color: var(--primary); }
+.border-accent-brand { border-color: var(--accent); }
+
+/* Scrollbars */
+.scrollbar-thin::-webkit-scrollbar { width: 8px; height: 8px; }
+.scrollbar-thin::-webkit-scrollbar-track { background: var(--bg-deep); }
+.scrollbar-thin::-webkit-scrollbar-thumb { background: var(--border-strong); }
+.scrollbar-thin::-webkit-scrollbar-thumb:hover { background: var(--accent); }
+
+/* ==========================================================
+   BUTTONS — Ultra-modern pill buttons with subtle shadows
+   ========================================================== */
+.btn-primary {
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-hover) 100%);
+  color: var(--bg-deep) !important;
+  font-family: var(--font-display);
+  font-weight: 700;
+  padding: 10px 22px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-size: 11px;
+  transition: all 200ms cubic-bezier(.2,.8,.2,1);
+  position: relative;
+  overflow: hidden;
+  border-radius: 10px;
+  box-shadow:
+    0 4px 14px color-mix(in srgb, var(--accent) 25%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.2),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.15);
+}
+.btn-primary::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.25), transparent);
+  transform: translateX(-100%);
+  transition: transform 650ms ease;
+}
+.btn-primary:hover:not(:disabled) {
+  background: linear-gradient(135deg, var(--accent-hover) 0%, var(--accent) 100%);
+  transform: translateY(-1.5px);
+  box-shadow:
+    0 8px 24px color-mix(in srgb, var(--accent) 45%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.25);
+  filter: brightness(1.05);
+}
+.btn-primary:hover:not(:disabled)::after { transform: translateX(100%); }
+.btn-primary:active:not(:disabled) { transform: translateY(0); }
+.btn-primary:disabled { opacity: 0.35; cursor: not-allowed; }
+
+.btn-secondary {
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  font-family: var(--font-display);
+  font-weight: 600;
+  padding: 9px 18px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  font-size: 11px;
+  transition: all 200ms cubic-bezier(.2,.8,.2,1);
+  border-radius: 10px;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15);
+}
+.btn-secondary:hover:not(:disabled) {
+  background: var(--surface-3);
+  border-color: var(--accent);
+  color: var(--accent);
+  box-shadow:
+    0 4px 12px color-mix(in srgb, var(--accent) 15%, transparent);
+  transform: translateY(-1.5px);
+}
+.btn-secondary:disabled { opacity: 0.35; cursor: not-allowed; }
+
+.btn-ghost {
+  background: transparent;
+  color: var(--text-dim);
+  border: 1px solid transparent;
+  font-family: var(--font-display);
+  font-weight: 600;
+  padding: 7px 16px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  font-size: 10px;
+  transition: all 180ms ease;
+  border-radius: 8px;
+}
+.btn-ghost:hover:not(:disabled) {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+.btn-danger {
+  background: linear-gradient(135deg, var(--danger) 0%, var(--danger-hover) 100%);
+  color: #FFFFFF;
+  font-family: var(--font-display);
+  font-weight: 700;
+  padding: 10px 22px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-size: 11px;
+  position: relative;
+  overflow: hidden;
+  transition: all 200ms cubic-bezier(.2,.8,.2,1);
+  border-radius: 10px;
+  box-shadow:
+    0 4px 14px rgba(211, 47, 47, 0.25),
+    inset 0 1px 0 rgba(255, 255, 255, 0.15);
+}
+.btn-danger:hover:not(:disabled) {
+  background: linear-gradient(135deg, var(--danger-hover) 0%, var(--danger) 100%);
+  transform: translateY(-1.5px);
+  box-shadow: 0 8px 20px rgba(211, 47, 47, 0.40);
+}
+.btn-danger:active:not(:disabled) { transform: translateY(0); }
+
+.icon-btn {
+  padding: 6px;
+  color: var(--text-dim);
+  transition: all 140ms ease;
+  border: 1px solid transparent;
+  border-radius: 8px;
+}
+.icon-btn:hover {
+  color: var(--accent);
+  background: var(--surface-2);
+  border-color: var(--border-strong);
+}
+
+/* ==========================================================
+   PANELS — sharp armor-plate styling
+   ========================================================== */
+.panel {
+  background: var(--glass);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  position: relative;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+}
+
+.panel-stamp {
+  background: var(--glass);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border);
+  border-top: 3px solid var(--accent);
+  border-radius: 14px;
+  position: relative;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+}
+
+/* Corner brackets - disabled for clean styling */
+.corner-brackets { position: relative; }
+.corner-brackets::before,
+.corner-brackets::after {
+  display: none !important;
+}
+
+.corner-brackets-full { position: relative; }
+.corner-brackets-full::before,
+.corner-brackets-full::after,
+.corner-brackets-full > .cbr-tr,
+.corner-brackets-full > .cbr-bl {
+  display: none !important;
+}
+
+/* ==========================================================
+   FORMS — flat + bottom-accent
+   ========================================================== */
+.input-field {
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  padding: 10px 14px;
+  font-size: 12px;
+  outline: none;
+  transition: all 180ms ease;
+  width: 100%;
+  font-family: var(--font-sans);
+  border-radius: 8px;
+}
+.input-field:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+.input-field::placeholder { color: var(--text-muted); }
+
+/* Overline label (military data tag) */
+.label-overline {
+  font-family: var(--font-sans);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.label-accent {
+  font-family: var(--font-sans);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--accent);
+  font-weight: 700;
+}
+
+/* ==========================================================
+   STATUS LEDS
+   ========================================================== */
+.status-led {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  position: relative;
+}
+.status-led::after {
+  content: '';
+  position: absolute;
+  inset: -4px;
+  border-radius: 50%;
+  background: inherit;
+  opacity: 0.35;
+  filter: blur(4px);
+  animation: led-pulse 1.6s ease-in-out infinite;
+}
+.status-led.running { background: var(--success); }
+.status-led.stopped { background: var(--text-muted); }
+.status-led.stopped::after { animation: none; opacity: 0.2; }
+.status-led.updating { background: var(--warning); }
+.status-led.installing { background: var(--accent); }
+.status-led.danger { background: var(--danger); }
+
+@keyframes led-pulse {
+  0%, 100% { opacity: 0.35; transform: scale(1); }
+  50%      { opacity: 0.75; transform: scale(1.25); }
+}
+
+/* ==========================================================
+   SERVER CARD — modernized dossier (v1.0.44 polish:
+   rounded corners + layered glow halo, no structural change)
+   ========================================================== */
+.server-card {
+  position: relative;
+  background:
+    radial-gradient(circle at 50% 0%, color-mix(in srgb, var(--accent) 8%, transparent) 0%, transparent 70%),
+    var(--glass);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border);
+  padding: 22px;
+  overflow: hidden;
+  border-radius: 16px;
+  transition: all 260ms cubic-bezier(.2,.8,.2,1);
+  box-shadow:
+    0 8px 24px rgba(0, 0, 0, 0.25),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+.server-card::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 3px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  opacity: 0.45;
+  transition: all 260ms ease;
+}
+.server-card::after {
+  display: none;
+}
+.server-card:hover {
+  border-color: var(--accent);
+}
+
+/* Inner pieces of the ServerCard */
+.server-card [data-testid^="metric-"] {
+  border-radius: 10px;
+  background: var(--surface-2);
+  transition: all 200ms ease;
+}
+.server-card [data-testid^="metric-"]:hover {
+  border-color: var(--accent);
+  background: var(--surface-3);
+}
+.server-card [data-testid^="card-connect-info-"] {
+  border-radius: 8px;
+}
+.server-card [data-testid^="connect-health-led-"] {
+  border-radius: 8px;
+}
+
+/* Icon buttons inside the action row sit nicer as pills */
+.server-card .icon-btn {
+  border-radius: 8px;
+}
+
+/* ==========================================================
+   FLEET STAT TILES — v1.0.44 modernised "şaşaalı" top row
+   (Total Servers / Running / Stopped). Layered glow halo +
+   animated flash whenever the displayed value changes so
+   admins instantly catch fleet movement.
+   ========================================================== */
+.stat-tile-modern {
+  --tile-color: var(--text);
+  --tile-soft:  color-mix(in srgb, var(--text-dim) 10%, transparent);
+  border-radius: 16px;
+  background:
+    radial-gradient(circle at 50% 0%, var(--tile-soft) 0%, transparent 70%),
+    var(--glass);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--border);
+  box-shadow:
+    0 4px 14px rgba(0, 0, 0, 0.2),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  transition: all 260ms cubic-bezier(.2,.8,.2,1);
+}
+.stat-tile-modern:hover {
+  transform: translateY(-3px);
+  border-color: var(--tile-color);
+  box-shadow:
+    0 12px 28px rgba(0, 0, 0, 0.35),
+    0 0 20px color-mix(in srgb, var(--tile-color) 15%, transparent);
+}
+.stat-tile-modern .stat-tile-halo {
+  position: absolute;
+  inset: -40% -10% auto auto;
+  width: 140px;
+  height: 140px;
+  background: radial-gradient(circle, color-mix(in srgb, var(--tile-color) 30%, transparent) 0%, transparent 70%);
+  filter: blur(20px);
+  pointer-events: none;
+  opacity: 0.45;
+  z-index: 0;
+}
+.stat-tile-modern .stat-tile-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--tile-color) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--tile-color) 35%, transparent);
+  box-shadow: 0 0 10px color-mix(in srgb, var(--tile-color) 25%, transparent);
+}
+
+/* Visible "the number just changed!" flash. One-shot 700ms pulse:
+   border glow ripple + a quick scale on the numeric body. */
+@keyframes statTilePulse {
+  0%   { box-shadow: 0 0 0 0   color-mix(in srgb, var(--tile-color) 70%, transparent),
+                     0 4px 14px rgba(0, 0, 0, 0.2),
+                     inset 0 1px 0 rgba(255, 255, 255, 0.05); }
+  60%  { box-shadow: 0 0 0 12px color-mix(in srgb, var(--tile-color) 0%, transparent),
+                     0 18px 42px color-mix(in srgb, var(--tile-color) 45%, transparent),
+                     inset 0 1px 0 rgba(255, 255, 255, 0.10); }
+  100% { box-shadow: 0 0 0 0   color-mix(in srgb, var(--tile-color) 0%, transparent),
+                     0 4px 14px rgba(0, 0, 0, 0.2),
+                     inset 0 1px 0 rgba(255, 255, 255, 0.05); }
+}
+@keyframes statTileNumberBump {
+  0%   { transform: scale(1); }
+  40%  { transform: scale(1.18); }
+  100% { transform: scale(1); }
+}
+.stat-tile-flash {
+  animation: statTilePulse 700ms ease-out;
+  border-color: color-mix(in srgb, var(--tile-color) 75%, var(--border)) !important;
+}
+.stat-tile-flash > div:last-child {
+  display: inline-block;
+  transform-origin: left center;
+  animation: statTileNumberBump 700ms ease-out;
+}
+
+/* ==========================================================
+   DEPLOY NEW SERVER CTA
+   ========================================================== */
+.deploy-cta-modern {
+  border-radius: 16px;
+  background:
+    radial-gradient(circle at 50% 50%, color-mix(in srgb, var(--accent) 12%, transparent) 0%, transparent 100%),
+    var(--glass);
+  backdrop-filter: blur(12px);
+  border: 1px dashed var(--accent);
+  box-shadow:
+    0 4px 14px rgba(0, 0, 0, 0.2),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  transition: all 260ms cubic-bezier(.2,.8,.2,1);
+}
+.deploy-cta-modern:hover {
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-hover) 100%);
+  border-color: var(--accent);
+  border-style: solid;
+  transform: translateY(-3px);
+  box-shadow:
+    0 12px 28px color-mix(in srgb, var(--accent) 30%, transparent),
+    0 0 20px color-mix(in srgb, var(--accent) 25%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.25);
+}
+.deploy-cta-halo {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle at 80% 50%, color-mix(in srgb, var(--accent) 25%, transparent) 0%, transparent 60%);
+  filter: blur(18px);
+  opacity: 0.6;
+  pointer-events: none;
+  transition: opacity 220ms ease;
+}
+.deploy-cta-modern:hover .deploy-cta-halo { opacity: 0; }
+
+/* ==========================================================
+   CTA PILLS — v1.0.46 (replaces .diagonal-split-cta which read
+   as visually broken). Two side-by-side pill panels, each with
+   its own accent halo.
+   ========================================================== */
+.cta-pill {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 18px;
+  min-width: 200px;
+  border-radius: 999px;
+  background: linear-gradient(180deg, var(--surface) 0%, var(--bg-deep) 100%);
+  border: 1px solid var(--border);
+  overflow: hidden;
+  cursor: pointer;
+  transition: transform 220ms cubic-bezier(.2,.8,.2,1),
+              background 240ms ease,
+              border-color 240ms ease,
+              box-shadow 260ms ease;
+  box-shadow:
+    0 4px 14px rgba(0, 0, 0, 0.35),
+    inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+.cta-pill:hover { transform: translateY(-3px); }
+.cta-pill-icon {
+  position: relative;
+  z-index: 1;
+  filter: drop-shadow(0 0 6px currentColor);
+}
+.cta-pill-text {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  line-height: 1.05;
+  position: relative;
+  z-index: 1;
+  font-family: var(--font-display);
+  text-transform: uppercase;
+}
+.cta-pill-sub {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  opacity: 0.85;
+}
+.cta-pill-title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  color: var(--text);
+}
+.cta-pill-halo {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.55;
+  transition: opacity 240ms ease;
+  background: radial-gradient(circle at 0% 50%, color-mix(in srgb, currentColor 30%, transparent) 0%, transparent 70%);
+}
+.cta-pill:hover .cta-pill-halo { opacity: 0.95; }
+
+/* Local accent (orange) */
+.cta-pill-local {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+}
+.cta-pill-local:hover {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 14%, var(--surface)) 0%, var(--bg-deep) 100%);
+  border-color: var(--accent);
+  box-shadow:
+    0 12px 28px color-mix(in srgb, var(--accent) 40%, rgba(0,0,0,0.4)),
+    0 0 22px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+/* Remote accent (cyan/blue) */
+.cta-pill-remote {
+  color: #4FB1E8;
+  border-color: color-mix(in srgb, #4FB1E8 55%, var(--border));
+}
+.cta-pill-remote:hover {
+  background: linear-gradient(180deg, color-mix(in srgb, #4FB1E8 14%, var(--surface)) 0%, var(--bg-deep) 100%);
+  border-color: #4FB1E8;
+  box-shadow:
+    0 12px 28px color-mix(in srgb, #4FB1E8 40%, rgba(0,0,0,0.4)),
+    0 0 22px color-mix(in srgb, #4FB1E8 35%, transparent);
+}
+
+/* v1.0.51 — TESTING lock state. Pill is greyed, halo is killed, and a
+   diagonal "TESTING" ribbon stripe is drawn corner-to-corner so the
+   admin can see at a glance that this CTA is intentionally out of order. */
+.cta-pill-locked {
+  cursor: not-allowed;
+  filter: saturate(0.45) brightness(0.85);
+}
+.cta-pill-locked:hover {
+  transform: none;
+  background: linear-gradient(180deg, var(--surface) 0%, var(--bg-deep) 100%) !important;
+  border-color: var(--border) !important;
+  box-shadow:
+    0 4px 14px rgba(0, 0, 0, 0.35),
+    inset 0 1px 0 rgba(255, 255, 255, 0.04) !important;
+}
+.cta-pill-locked .cta-pill-halo { opacity: 0.15 !important; }
+.cta-pill-locked .cta-pill-icon,
+.cta-pill-locked .cta-pill-text { opacity: 0.5; }
+.cta-pill-ribbon {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%) rotate(-12deg);
+  padding: 3px 32px;
+  background: linear-gradient(135deg, #FFD700 0%, #FFA000 100%);
+  color: #0A0A0C;
+  font-family: var(--font-display);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+  border: 1px solid rgba(0, 0, 0, 0.35);
+  box-shadow:
+    0 4px 12px rgba(255, 165, 0, 0.45),
+    inset 0 1px 0 rgba(255, 255, 255, 0.4),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.25);
+  z-index: 5;
+  pointer-events: none;
+  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.35);
+  white-space: nowrap;
+}
+
+/* ==========================================================
+   CARD TYPE BADGE — v1.0.46. Tiny pill at the very top-left
+   of each ServerCard / RemoteServerCard signalling whether
+   this is a locally-installed dedicated server or a remotely-
+   managed portal server. Sits in the natural document flow at
+   the top of the card so it doesn't overlap content.
+   ========================================================== */
+.card-type-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  margin-bottom: 12px;
+  border-radius: 999px;
+  font-family: var(--font-display);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  border: 1px solid;
+}
+.card-type-badge--local {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--accent) 25%, transparent);
+}
+.card-type-badge--portal {
+  background: color-mix(in srgb, #4FB1E8 14%, transparent);
+  color: #4FB1E8;
+  border-color: color-mix(in srgb, #4FB1E8 50%, transparent);
+  box-shadow: 0 0 12px color-mix(in srgb, #4FB1E8 25%, transparent);
+}
+
+/* ==========================================================
+   REMOTE SERVER CARD — visual sibling of .server-card with a
+   subtle blue/cyan tint so admins can tell remote-managed from
+   local-installed at a glance.
+   ========================================================== */
+.remote-server-card {
+  background:
+    radial-gradient(circle at 0% 0%, color-mix(in srgb, #4FB1E8 8%, transparent) 0%, transparent 45%),
+    linear-gradient(180deg, var(--surface) 0%, var(--bg-deep) 100%);
+  border-color: color-mix(in srgb, #4FB1E8 35%, var(--border));
+}
+.remote-server-card::before {
+  background: linear-gradient(90deg, transparent, #4FB1E8, transparent);
+}
+.remote-server-card:hover {
+  border-color: color-mix(in srgb, #4FB1E8 70%, var(--border));
+  box-shadow:
+    0 18px 44px rgba(0, 0, 0, 0.55),
+    0 0 0 1px color-mix(in srgb, #4FB1E8 35%, transparent),
+    0 0 32px color-mix(in srgb, #4FB1E8 18%, transparent);
+}
+.remote-card-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+  background: color-mix(in srgb, #4FB1E8 12%, transparent);
+  border: 1px solid color-mix(in srgb, #4FB1E8 45%, transparent);
+  color: #4FB1E8;
+  box-shadow: 0 0 14px color-mix(in srgb, #4FB1E8 30%, transparent);
+}
+.provider-pill {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.10em;
+  background: color-mix(in srgb, #4FB1E8 14%, transparent);
+  color: #4FB1E8;
+  border: 1px solid color-mix(in srgb, #4FB1E8 35%, transparent);
+}
+
+/* Hazard stripe background (for destructive sections) */
+.hazard-stripe {
+  background-image: repeating-linear-gradient(
+    45deg,
+    var(--surface) 0 8px,
+    var(--surface-3) 8px 16px
+  );
+}
+
+/* ==========================================================
+   NAV TABS
+   ========================================================== */
+.nav-tab {
+  font-family: var(--font-display);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 12px 20px;
+  border-bottom: 2px solid transparent;
+  transition: all 180ms ease;
+  position: relative;
+  white-space: nowrap;
+}
+.nav-tab.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+/* ==========================================================
+   ANIMATIONS
+   ========================================================== */
+@keyframes pulse-ring {
+  0%, 100% { box-shadow: 0 0 0 0 var(--accent-soft); }
+  50%      { box-shadow: 0 0 0 8px transparent; }
+}
+.pulse-ring { animation: pulse-ring 1.8s ease-in-out infinite; }
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes update-btn-pulse-glow {
+  0%, 100% {
+    box-shadow: 0 0 0 0 var(--accent-soft), 0 0 0 0 var(--accent-soft);
+    filter: brightness(1);
+  }
+  50% {
+    box-shadow: 0 0 0 3px var(--accent-soft), 0 0 22px 3px var(--accent-soft);
+    filter: brightness(1.18);
+  }
+}
+.update-btn-pulse {
+  animation: update-btn-pulse-glow 1.8s ease-in-out infinite;
+}
+@keyframes update-dot-pulse {
+  0%, 100% { transform: scale(1);   opacity: 1; }
+  50%      { transform: scale(1.6); opacity: 0.55; }
+}
+.update-dot-pulse { animation: update-dot-pulse 1.2s ease-in-out infinite; }
+@keyframes spin-slow { to { transform: rotate(360deg); } }
+.animate-spin-slow { animation: spin-slow 4s linear infinite; }
+
+/* Disabled boot-scan for clean modern aesthetic */
+.boot-scan {
+  display: none !important;
+}
+
+@keyframes terminal-blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+.cursor-blink::after {
+  content: '▊';
+  color: var(--accent);
+  animation: terminal-blink 1s steps(2) infinite;
+  margin-left: 2px;
+}
+
+@keyframes hazard-slide {
+  from { background-position: 0 0; }
+  to   { background-position: 32px 0; }
+}
+.hazard-stripe-anim {
+  background-image: repeating-linear-gradient(
+    45deg,
+    var(--accent) 0 6px,
+    var(--bg-deep) 6px 12px
+  );
+  animation: hazard-slide 800ms linear infinite;
+}
+
+/* Force standard modern border radius for UI components */
+button, input, select, textarea {
+  border-radius: 8px;
+}
+
+@layer base {
+  * { @apply border-border; }
+}

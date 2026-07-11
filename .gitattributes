@@ -1,0 +1,6 @@
+# GitHub Linguist hygiene
+frontend/package-lock.json linguist-generated=true
+electron/package-lock.json linguist-generated=true
+frontend/public/index.html linguist-generated=true
+electron/installer/*.nsh linguist-vendored
+Globalization/*.xaml linguist-vendored

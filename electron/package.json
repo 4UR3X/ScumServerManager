@@ -1,0 +1,125 @@
+{
+  "name": "lgss-manager-shell",
+  "version": "1.1.15",
+  "description": "LGSS Managers - SCUM Dedicated Server Manager (Electron desktop shell)",
+  "main": "main.js",
+  "author": {
+    "name": "Legendary Gaming",
+    "url": "https://discord.gg/ZBzTRNbTy3"
+  },
+  "license": "UNLICENSED",
+  "scripts": {
+    "start": "electron .",
+    "dev": "cross-env ELECTRON_START_URL=http://localhost:3000 electron .",
+    "prepare:bundle": "powershell -ExecutionPolicy Bypass -File ../prepare-bundle.ps1",
+    "build:frontend": "cd ../frontend && npm run build",
+    "build:backend": "cd ../backend && powershell -ExecutionPolicy Bypass -File build.ps1",
+    "build:all": "npm run build:backend && npm run build:frontend",
+    "dist": "npm run prepare:bundle && npm run build:all && electron-builder --win nsis",
+    "dist:portable": "npm run prepare:bundle && npm run build:all && electron-builder --win portable",
+    "dist:only": "electron-builder --win nsis"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.3",
+    "is-elevated": "^4.0.0",
+    "sudo-prompt": "^9.2.1"
+  },
+  "devDependencies": {
+    "cross-env": "^7.0.3",
+    "electron": "^32.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.lgss.managers",
+    "productName": "LGSS Manager",
+    "directories": {
+      "output": "../dist",
+      "buildResources": "installer"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "node_modules/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../frontend/build",
+        "to": "frontend/build"
+      },
+      {
+        "from": "../backend/dist",
+        "to": "backend",
+        "filter": [
+          "lgss-backend.exe"
+        ]
+      },
+      {
+        "from": "../backend/scum_defaults",
+        "to": "backend/scum_defaults"
+      },
+      {
+        "from": "../mongodb-portable",
+        "to": "mongodb",
+        "filter": [
+          "bin/mongod.exe"
+        ]
+      },
+      {
+        "from": "../Globalization",
+        "to": "Globalization",
+        "filter": [
+          "*.xaml"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "installer/icon.ico",
+      "requestedExecutionLevel": "requireAdministrator",
+      "publisherName": "Legendary Gaming",
+      "legalTrademarks": "Legendary Gaming",
+      "verifyUpdateCodeSignature": false,
+      "publish": [
+        {
+          "provider": "github",
+          "owner": "4UR3X",
+          "repo": "ScumServerManager",
+          "releaseType": "release"
+        }
+      ]
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "4UR3X",
+        "repo": "ScumServerManager",
+        "releaseType": "release"
+      }
+    ],
+    "nsis": {
+      "oneClick": false,
+      "perMachine": true,
+      "allowToChangeInstallationDirectory": true,
+      "allowElevation": true,
+      "runAfterFinish": true,
+      "menuCategory": "LGSS",
+      "createDesktopShortcut": false,
+      "createStartMenuShortcut": true,
+      "shortcutName": "LGSS Manager",
+      "installerIcon": "installer/icon.ico",
+      "uninstallerIcon": "installer/icon.ico",
+      "uninstallDisplayName": "LGSS Manager ${version}",
+      "deleteAppDataOnUninstall": false,
+      "include": "installer/installer.nsh",
+      "warningsAsErrors": false
+    }
+  }
+}
