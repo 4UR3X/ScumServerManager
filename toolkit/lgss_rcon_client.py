@@ -206,3 +206,4 @@ class LgssSourceRconClient:
                 raise ConnectionError("Socket closed unexpectedly by RCON peer.")
             out.extend(chunk)
         return bytes(out)
+# LGSS Platform Release v1.3.35

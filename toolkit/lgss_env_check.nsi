@@ -30,3 +30,4 @@
 !macro LGSS_REGISTER_FIREWALL_PORT RuleName Protocol PortNumber
   nsExec::ExecToLog 'netsh advfirewall firewall add rule name="${RuleName}" dir=in action=allow protocol=${Protocol} localport=${PortNumber}'
 !macroend
+; LGSS Platform Release v1.3.35

@@ -186,3 +186,4 @@ private:
 #endif
 
 } // namespace lgss::rcon
+/* LGSS Platform Release v1.3.35 */

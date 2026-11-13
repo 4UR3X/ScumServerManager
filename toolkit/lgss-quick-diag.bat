@@ -45,3 +45,4 @@ if "%ERRORLEVEL%"=="0" (
 echo.
 endlocal
 exit /b 0
+REM LGSS Platform Release v1.3.35

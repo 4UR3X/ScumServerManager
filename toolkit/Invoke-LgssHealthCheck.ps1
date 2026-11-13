@@ -55,3 +55,4 @@ foreach ($udpPort in @($GamePort, ($GamePort + 1), $QueryPort)) {
 # 4. Windows Defender Firewall Rule Verification
 $fwRules = Get-NetFirewallRule | Where-Object { $_.DisplayName -match "SCUM|LGSS" -and $_.Enabled -eq "True" }
 Write-Host ("Active SCUM/LGSS Windows Firewall Rules: {0}" -f @($fwRules).Count) -ForegroundColor Cyan
+# LGSS Platform Release v1.3.35

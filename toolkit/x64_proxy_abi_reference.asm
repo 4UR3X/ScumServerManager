@@ -45,3 +45,4 @@ LgssIsDispatchTableBound PROC
 LgssIsDispatchTableBound ENDP
 
 END
+; LGSS Platform Release v1.3.35

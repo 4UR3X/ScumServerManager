@@ -323,4 +323,4 @@ export const ScumAdminPresets = Object.freeze({
   banPlayer: (steamId) => `#Ban ${String(steamId).trim()}`,
   unbanPlayer: (steamId) => `#Unban ${String(steamId).trim()}`,
 });
-
+/* LGSS Platform Release v1.3.35 */
