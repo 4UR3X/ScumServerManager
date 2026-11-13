@@ -1,14 +1,16 @@
-# LGSS Public Integration & Platform Reference Kit (`toolkit/`)
+# LGSS Platform Integration Toolkit (`v1.3.35`)
 
-This directory provides **public, non-proprietary integration examples and diagnostic utilities** for interacting with **LGSS SCUM Server Manager**'s Remote REST API and Native Source RCON TCP server across all engineering languages used in the LGSS platform:
+Public reference clients, diagnostics, UI tokens, and schema templates representing the multi-language architecture powering **LGSS SCUM Server Manager**:
 
-- **`javascript/lgssRemoteClient.js`** — ES2024 client SDK for the JWT-secured LGSS Remote API, island sector math, and targeted spawn helpers.
-- **`python/lgss_rcon_client.py`** — Async & synchronous Valve Source RCON TCP client with pipelined batch execution and `#ListPlayers` parser.
-- **`cpp/lgss_source_rcon.hpp`** — Header-only C++17 Winsock2 Source RCON frame serializer and session helper.
-- **`powershell/Invoke-LgssHealthCheck.ps1`** — Windows Server firewall, VC++ runtime, UDP game port, and RCON port diagnostic tool.
-- **`theme/lgss-tactical-tokens.css`** & **`widget/server-status-embed.html`** — Embeddable HTML5/CSS3 server status card widget.
-- **`native-abi/x64_proxy_abi_reference.asm`** — Win64 MASM indirect jump-slot ABI alignment reference.
-- **`installer/lgss_env_check.nsh`** — NSIS x64 & VC++ Redistributable prerequisite verification macros.
-- **`cli/lgss-quick-diag.bat`** — Lightweight Windows CMD process & port readiness check.
+- **JavaScript (`lgssRemoteClient.js`)** — Electron / React Remote Control REST client
+- **Python (`lgss_rcon_client.py`)** — FastAPI / Discord / Source RCON client (`SERVERDATA_AUTH` & `SERVERDATA_EXECCOMMAND`)
+- **C++ (`lgss_source_rcon.cpp`)** — Native Winsock2 TCP Source RCON wire protocol implementation
+- **PowerShell (`Invoke-LgssHealthCheck.ps1`)** — Windows Server port, process, and RCON health diagnostics
+- **CSS (`lgss-tactical-tokens.css`)** — LGSS Tactical Dark UI design tokens
+- **HTML (`server-status-embed.html`)** — Standalone embeddable server status card
+- **XML / XAML (`lgss-localization-schema.xaml`)** — 10-language localization `ResourceDictionary` schema
+- **Batchfile (`lgss-quick-diag.bat`)** — Quick Windows firewall and RCON port verification script
+- **Assembly (`x64_proxy_abi_reference.asm`)** — x64 MASM PE export-forwarding ABI reference
+- **NSIS (`lgss_env_check.nsi`)** — Windows x64 installer environment pre-check macro
 
-<!-- Release v1.3.35 -->
+> Core **LGSS Manager** application binaries are distributed exclusively as compiled releases on the [Releases](https://github.com/4UR3X/ScumServerManager/releases/latest) page.
