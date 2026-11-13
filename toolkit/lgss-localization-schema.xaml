@@ -1,0 +1,20 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:sys="clr-namespace:System;assembly=mscorlib">
+    <!-- LGSS SCUM Server Manager v1.3.35 - Public Localization Resource Schema Sample -->
+    <!-- Supported Locales: en-US, tr-TR, de-DE, ru-RU, fr-FR, es-ES, pt-BR, pl-PL, zh-CN, ja-JP -->
+    <sys:String x:Key="App.Title">LGSS SCUM Server Manager</sys:String>
+    <sys:String x:Key="App.Subtitle">Dedicated Server Administration &amp; Native Source RCON Platform</sys:String>
+    <sys:String x:Key="Nav.Servers">Servers</sys:String>
+    <sys:String x:Key="Nav.NativeRcon">RCON Console</sys:String>
+    <sys:String x:Key="Nav.AdminHelper">Admin Helper</sys:String>
+    <sys:String x:Key="Nav.Settings">Server Settings</sys:String>
+    <sys:String x:Key="Nav.TraderEconomy">Trader &amp; Economy</sys:String>
+    <sys:String x:Key="Nav.Automation">Scheduled Automation</sys:String>
+    <sys:String x:Key="Nav.DiscordBridge">Discord Integration</sys:String>
+    <sys:String x:Key="Nav.Players">Live Players</sys:String>
+    <sys:String x:Key="Nav.Logs">Server Logs</sys:String>
+    <sys:String x:Key="Nav.Backups">Backups &amp; Recovery</sys:String>
+    <sys:String x:Key="Rcon.Status.Online">Native Source RCON Online (0-Player Server Authority)</sys:String>
+    <sys:String x:Key="AdminHelper.SelectPlayerPrompt">Select an online player target before dispatching items</sys:String>
+</ResourceDictionary>

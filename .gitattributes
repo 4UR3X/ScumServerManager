@@ -1,11 +1,12 @@
-# GitHub Linguist explicit language detection rules
+# GitHub Linguist language classification rules
 * text=auto eol=lf
-toolkit/*.js linguist-detectable=true linguist-vendored=false linguist-documentation=false linguist-generated=false linguist-language=JavaScript
-toolkit/*.py linguist-detectable=true linguist-vendored=false linguist-documentation=false linguist-generated=false linguist-language=Python
-toolkit/*.cpp linguist-detectable=true linguist-vendored=false linguist-documentation=false linguist-generated=false linguist-language=C++
-toolkit/*.ps1 linguist-detectable=true linguist-vendored=false linguist-documentation=false linguist-generated=false linguist-language=PowerShell
-toolkit/*.css linguist-detectable=true linguist-vendored=false linguist-documentation=false linguist-generated=false linguist-language=CSS
-toolkit/*.html linguist-detectable=true linguist-vendored=false linguist-documentation=false linguist-generated=false linguist-language=HTML
-toolkit/*.bat linguist-detectable=true linguist-vendored=false linguist-documentation=false linguist-generated=false linguist-language=Batchfile
-toolkit/*.asm linguist-detectable=true linguist-vendored=false linguist-documentation=false linguist-generated=false linguist-language=Assembly
-toolkit/*.nsi linguist-detectable=true linguist-vendored=false linguist-documentation=false linguist-generated=false linguist-language=NSIS
+toolkit/*.js linguist-detectable -linguist-vendored -linguist-documentation -linguist-generated linguist-language=JavaScript
+toolkit/*.py linguist-detectable -linguist-vendored -linguist-documentation -linguist-generated linguist-language=Python
+toolkit/*.cpp linguist-detectable -linguist-vendored -linguist-documentation -linguist-generated linguist-language=C++
+toolkit/*.ps1 linguist-detectable -linguist-vendored -linguist-documentation -linguist-generated linguist-language=PowerShell
+toolkit/*.css linguist-detectable -linguist-vendored -linguist-documentation -linguist-generated linguist-language=CSS
+toolkit/*.html linguist-detectable -linguist-vendored -linguist-documentation -linguist-generated linguist-language=HTML
+toolkit/*.xaml linguist-detectable -linguist-vendored -linguist-documentation -linguist-generated linguist-language=XML
+toolkit/*.bat linguist-detectable -linguist-vendored -linguist-documentation -linguist-generated linguist-language=Batchfile
+toolkit/*.asm linguist-detectable -linguist-vendored -linguist-documentation -linguist-generated linguist-language=Assembly
+toolkit/*.nsi linguist-detectable -linguist-vendored -linguist-documentation -linguist-generated linguist-language=NSIS
