@@ -1,0 +1,88 @@
+/*
+ * LGSS SCUM Server Manager — Public Tactical UI Design Tokens
+ * Copyright (c) 2026 Legendary Gaming (4UR3X).
+ * Reusable CSS variables and badge utilities for external community status widgets.
+ */
+
+:root {
+  --lgss-bg-deep: #0b0d11;
+  --lgss-bg-panel: #111318;
+  --lgss-bg-elevated: #171a21;
+  --lgss-border-subtle: rgba(255, 255, 255, 0.09);
+  --lgss-border-accent: rgba(249, 115, 22, 0.45);
+  --lgss-accent-orange: #f97316;
+  --lgss-accent-amber: #f59e0b;
+  --lgss-status-online: #10b981;
+  --lgss-status-offline: #ef4444;
+  --lgss-text-primary: #f4f4f5;
+  --lgss-text-secondary: #a1a1aa;
+  --lgss-font-mono: "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
+}
+
+.lgss-status-card {
+  background: linear-gradient(180deg, var(--lgss-bg-panel) 0%, var(--lgss-bg-deep) 100%);
+  border: 1px solid var(--lgss-border-subtle);
+  border-radius: 14px;
+  padding: 18px 20px;
+  color: var(--lgss-text-primary);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+  max-width: 440px;
+}
+
+.lgss-status-card__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--lgss-border-subtle);
+}
+
+.lgss-status-card__title {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  margin: 0;
+}
+
+.lgss-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-family: var(--lgss-font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.lgss-badge--online {
+  background: rgba(16, 185, 129, 0.14);
+  color: #6ee7b7;
+  border: 1px solid rgba(16, 185, 129, 0.35);
+}
+
+.lgss-badge--offline {
+  background: rgba(239, 68, 68, 0.14);
+  color: #fca5a5;
+  border: 1px solid rgba(239, 68, 68, 0.35);
+}
+
+.lgss-telemetry-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 14px;
+  font-family: var(--lgss-font-mono);
+  font-size: 12px;
+}
+
+.lgss-telemetry-cell {
+  background: var(--lgss-bg-elevated);
+  border: 1px solid var(--lgss-border-subtle);
+  border-radius: 8px;
+  padding: 8px 10px;
+}

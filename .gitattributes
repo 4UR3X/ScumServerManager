@@ -1,0 +1,6 @@
+# GitHub Linguist configuration
+*.html linguist-detectable=true
+*.nsi linguist-detectable=true
+*.bat linguist-detectable=true
+*.ps1 linguist-detectable=true
+*.asm linguist-detectable=true

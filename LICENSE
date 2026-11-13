@@ -1,0 +1,79 @@
+LGSS SCUM SERVER MANAGER
+END USER LICENSE AGREEMENT (EULA)
+
+Software: LGSS SCUM Server Manager (LGSS Manager)
+Current Release: v1.3.35
+Effective Date: November 14, 2026
+Copyright (c) 2026 Legendary Gaming (4UR3X). All rights reserved.
+
+IMPORTANT — READ CAREFULLY:
+This End User License Agreement (the "Agreement") is a legally binding contract
+between you (an individual or legal entity, "you" or "Licensee") and
+Legendary Gaming / 4UR3X ("Licensor" or "Author") governing your download,
+installation, and use of LGSS SCUM Server Manager, including its desktop
+shell, backend runtime, native Source RCON engine (dwmapi.dll), installer,
+user interface, updates, and accompanying documentation (collectively, the
+"Software").
+
+By downloading, installing, launching, or otherwise using the Software, you
+accept and agree to be bound by the terms of this Agreement. If you do not
+agree to these terms, do not download, install, or use the Software.
+
+1. PROPRIETARY SOFTWARE & CLOSED-SOURCE NOTICE
+   The Software is proprietary, closed-source software owned exclusively by
+   Legendary Gaming (4UR3X). The Software is licensed, not sold. No title,
+   ownership, or intellectual property rights are transferred to you.
+   The public GitHub repository (4UR3X/ScumServerManager) serves strictly as
+   the official binary release distribution channel, auto-update endpoint,
+   documentation portal, and public client integration reference. Source code
+   of LGSS Manager is not published and is not open source.
+
+2. GRANT OF LICENSE
+   Subject to continuous compliance with this Agreement, Licensor grants you a
+   personal, non-exclusive, non-transferable, revocable, royalty-free license
+   to:
+   (a) Download, install, and execute official builds of the Software on
+       Windows workstations or dedicated server machines under your lawful
+       control; and
+   (b) Operate the Software to manage SCUM Dedicated Server instances that you
+       own or are explicitly authorized to administer (including community
+       servers accepting voluntary player donations or VIP memberships).
+
+3. RESTRICTIONS
+   You may NOT, directly or indirectly:
+   (a) Sell, rent, lease, sublicense, monetize access to, or charge fees for
+       downloading, installing, or distributing the Software;
+   (b) Reverse-engineer, decompile, disassemble, unpack, extract embedded
+       bytecodes or native binaries, or attempt to reconstruct the source code
+       of the Software or its Native RCON module, except to the narrow extent
+       expressly permitted by non-waivable applicable law;
+   (c) Modify, patch, tamper with, rebrand, remove copyright notices from, or
+       repackage the Software or distribute unofficial/modified installers;
+   (d) Claim authorship of the Software or misrepresent unofficial builds as
+       endorsed by Legendary Gaming.
+
+4. UPDATES & TELEMETRY PRIVACY
+   The Software includes a built-in update checker that queries GitHub
+   Releases of 4UR3X/ScumServerManager to notify administrators of new builds.
+   Server configurations, RCON passwords, Discord bot tokens, and player
+   databases remain locally on your machine and are never transmitted to
+   Legendary Gaming servers.
+
+5. THIRD-PARTY COMPONENTS
+   Bundled open-source runtime dependencies (such as Electron, Python,
+   Portable MongoDB, and UI libraries) remain governed by their respective
+   licenses as listed in THIRD-PARTY-LICENSES.md.
+
+6. DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY
+   THE SOFTWARE IS PROVIDED "AS IS" AND "AS AVAILABLE", WITHOUT WARRANTY OF
+   ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, OR NON-INFRINGEMENT.
+   IN NO EVENT SHALL LEGENDARY GAMING OR THE AUTHOR BE LIABLE FOR ANY DATA
+   LOSS, SAVE CORRUPTION, SERVER DOWNTIME, OR INDIRECT, INCIDENTAL, OR
+   CONSEQUENTIAL DAMAGES ARISING FROM THE USE OF THE SOFTWARE. ALWAYS MAINTAIN
+   REGULAR SERVER BACKUPS.
+
+7. NON-AFFILIATION
+   LGSS SCUM Server Manager is an independent community administration tool
+   created by Legendary Gaming and is not affiliated with, endorsed by, or an
+   official product of Gamepires or Jagex.
