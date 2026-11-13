@@ -1,6 +1,11 @@
-# GitHub Linguist configuration
-*.html linguist-detectable=true
-*.nsi linguist-detectable=true
-*.bat linguist-detectable=true
-*.ps1 linguist-detectable=true
-*.asm linguist-detectable=true
+# GitHub Linguist explicit language detection rules
+* text=auto eol=lf
+toolkit/*.js linguist-detectable=true linguist-vendored=false linguist-documentation=false linguist-generated=false linguist-language=JavaScript
+toolkit/*.py linguist-detectable=true linguist-vendored=false linguist-documentation=false linguist-generated=false linguist-language=Python
+toolkit/*.cpp linguist-detectable=true linguist-vendored=false linguist-documentation=false linguist-generated=false linguist-language=C++
+toolkit/*.ps1 linguist-detectable=true linguist-vendored=false linguist-documentation=false linguist-generated=false linguist-language=PowerShell
+toolkit/*.css linguist-detectable=true linguist-vendored=false linguist-documentation=false linguist-generated=false linguist-language=CSS
+toolkit/*.html linguist-detectable=true linguist-vendored=false linguist-documentation=false linguist-generated=false linguist-language=HTML
+toolkit/*.bat linguist-detectable=true linguist-vendored=false linguist-documentation=false linguist-generated=false linguist-language=Batchfile
+toolkit/*.asm linguist-detectable=true linguist-vendored=false linguist-documentation=false linguist-generated=false linguist-language=Assembly
+toolkit/*.nsi linguist-detectable=true linguist-vendored=false linguist-documentation=false linguist-generated=false linguist-language=NSIS
