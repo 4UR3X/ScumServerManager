@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/4UR3X/ScumServerManager/releases/latest"><img src="https://img.shields.io/badge/Download-LGSS%20Manager%20v1.3.35-ff7a18?style=for-the-badge" alt="Download LGSS Manager" /></a>
+  <a href="https://github.com/4UR3X/ScumServerManager/releases/latest"><img src="https://img.shields.io/badge/Download-LGSS%20Manager%20v1.3.36-ff7a18?style=for-the-badge" alt="Download LGSS Manager" /></a>
   <img src="https://img.shields.io/badge/Windows-10%20%2F%2011%20%2F%20Server%20x64-0078d4?style=for-the-badge" alt="Windows 10 / 11 / Server x64" />
   <img src="https://img.shields.io/badge/Interface-10%20Languages-3fb950?style=for-the-badge" alt="10 Supported Languages" />
   <a href="https://discord.gg/ZBzTRNbTy3"><img src="https://img.shields.io/badge/Discord-Legendary%20Gaming-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord Community" /></a>
@@ -142,7 +142,7 @@ LGSS Manager is engineered as a hybrid native + asynchronous desktop stack acros
 
 ## Getting Started & Installation
 
-1. Download **`LGSS-Manager-Setup-1.3.35.exe`** from the **[Official Releases Page](https://github.com/4UR3X/ScumServerManager/releases/latest)**.
+1. Download **`LGSS-Manager-Setup-1.3.36.exe`** from the **[Official Releases Page](https://github.com/4UR3X/ScumServerManager/releases/latest)**.
 2. Run the installer on **Windows 10 / 11** or **Windows Server 2019 / 2022 / 2025 (x64)** with Administrator privileges.
 3. Select your root management workspace folder on first launch, then either **install a fresh SCUM Dedicated Server via SteamCMD** or **import an existing server directory**.
 4. Open the **RCON** tab (Native Source RCON activates automatically on server launch) and configure **Discord**, **Automation**, and **Remote API** modules as needed.

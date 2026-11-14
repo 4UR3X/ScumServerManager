@@ -6,7 +6,7 @@
  * or custom dashboards to an authorized LGSS Manager Remote API endpoint.
  */
 
-export const LGSS_SDK_VERSION = "1.3.35";
+export const LGSS_SDK_VERSION = "1.3.36";
 
 export const SCUM_MAP_SECTORS = Object.freeze([
   ["D4", "C4", "B4", "A4"],
@@ -323,5 +323,5 @@ export const ScumAdminPresets = Object.freeze({
   banPlayer: (steamId) => `#Ban ${String(steamId).trim()}`,
   unbanPlayer: (steamId) => `#Unban ${String(steamId).trim()}`,
 });
-/* LGSS Platform Release v1.3.35 */
-export const LGSS_TOOLKIT_VERSION = '1.3.35';
+/* LGSS Platform Release v1.3.36 */
+export const LGSS_TOOLKIT_VERSION = '1.3.36';

@@ -1,4 +1,4 @@
-# LGSS Platform Integration Toolkit (`v1.3.35`)
+# LGSS Platform Integration Toolkit (`v1.3.36`)
 
 Public reference clients, diagnostics, UI tokens, and schema templates representing the multi-language architecture powering **LGSS SCUM Server Manager**:
 
