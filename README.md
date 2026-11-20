@@ -6,11 +6,11 @@
 
 <p align="center">
   <strong>Complete Administration & Control Suite for SCUM Dedicated Servers</strong><br />
-  Native Source RCON · Admin Helper & Live Item Dispatch · Multi-Server Orchestration · Trader Economy · Discord Bot · Remote Web & Mobile Access
+  Native Source RCON · Live 4K SCUM Map & Custom Zones · Admin Helper · Multi-Server Orchestration · Trader Economy · Discord Bot · Remote Web & Mobile Access
 </p>
 
 <p align="center">
-  <a href="https://github.com/4UR3X/ScumServerManager/releases/latest"><img src="https://img.shields.io/badge/Download-LGSS%20Manager%20v1.3.36-ff7a18?style=for-the-badge" alt="Download LGSS Manager" /></a>
+  <a href="https://github.com/4UR3X/ScumServerManager/releases/latest"><img src="https://img.shields.io/badge/Download-LGSS%20Manager%20v1.3.59-ff7a18?style=for-the-badge" alt="Download LGSS Manager" /></a>
   <img src="https://img.shields.io/badge/Windows-10%20%2F%2011%20%2F%20Server%20x64-0078d4?style=for-the-badge" alt="Windows 10 / 11 / Server x64" />
   <img src="https://img.shields.io/badge/Interface-10%20Languages-3fb950?style=for-the-badge" alt="10 Supported Languages" />
   <a href="https://discord.gg/ZBzTRNbTy3"><img src="https://img.shields.io/badge/Discord-Legendary%20Gaming-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord Community" /></a>
@@ -19,6 +19,7 @@
 <p align="center">
   <a href="#about">About</a> ·
   <a href="#native-rcon">Native RCON</a> ·
+  <a href="#scum-map">Live SCUM Map & Zones</a> ·
   <a href="#admin-helper">Admin Helper</a> ·
   <a href="#features">Core Features</a> ·
   <a href="#economy-config">Config & Economy</a> ·
@@ -54,6 +55,17 @@ Everything required to run — including a non-AVX portable database engine comp
 - **Standard Valve Source RCON Protocol (TCP):** Listens directly on your configured RCON port (`28015` by default). Fully compatible simultaneously with LGSS Manager, **BattleMetrics**, external Discord bots, and `mcrcon` — even while the LGSS desktop UI is closed.
 - **One-Click Deployment & Auto-Healing:** Provisioned automatically onto managed SCUM servers with hot-reloadable configuration (`lgss_rcon.ini`) and instant reconnection after server restarts.
 - **Strict Explicit Target Safety:** World-spawn commands strictly validate explicit recipient `SteamID` or `"X Y Z"` coordinates, preventing accidental untargeted drops on live servers.
+
+---
+
+<a id="scum-map"></a>
+
+## Interactive 4K SCUM Map & Visual Custom Zones
+
+- **Real-Time 1.5s Live Player Radar:** Polls live UE4 GameThread coordinates over Native RCON so online players, aircraft, and vehicles move smoothly across a 4K satellite map without `SCUM.db` save lag.
+- **17-Model Vehicle & 3-Tier Bunker Tracking:** GPU-cached vector silhouettes and model-specific colors for all land, air, and sea vehicles (with true `item_entity.xml` lock/owner filtering), plus verified coordinates for **Abandoned (4)**, **Normal (8)**, and **Secret (8)** bunkers and Research Facilities.
+- **Safe Front-Bumper & Entrance `#Teleport`:** Offsets teleports 2.5–3 steps ahead of vehicle front bumpers / boat bows using live 3D `yaw`/`pitch` and directly to bunker entrance doors.
+- **Visual Custom Zones Studio:** Draw, drag, and resize **Circle** and **Rectangle** zones directly on the map with 64 per-zone rule overrides (*Safe Zone, PvP Arena, No-Raid*) and bidirectional live `SCUM.db` synchronization.
 
 ---
 
@@ -93,7 +105,8 @@ Designed for fast, error-free live server moderation and event hosting:
 
 ## Configuration, Raid Matrix & Trader Economy
 
-- **Categorized `ServerSettings.ini` Studio:** Edit hundreds of world, metabolism, puppet/animal, vehicle, base-building, drop-ship, and PvP/PvE parameters with clear descriptions, search filtering, and custom raw INI key preservation.
+- **Categorized `ServerSettings.ini` & In-Game Global Rules Studio:** Edit 550+ world, metabolism, puppet/animal, vehicle, base-building, drop-ship, PvP/PvE, and **64 in-game Global Configuration** parameters across 10 languages with custom raw INI key preservation.
+- **Virtual VPN & Static IP / DDNS Networking:** Built-in detection and step-by-step guides for **Radmin VPN**, **Tailscale**, **ZeroTier**, **LAN**, and **Static IP / DDNS** hosting setups.
 - **Visual Raid Times Editor (`RaidTimes.json`):** Interactive weekly raid schedule matrix supporting multiple daily intervals, timezone awareness, and raid announcements.
 - **Full Trader & Economy Studio (`EconomyOverride.json`):** Browse all outpost traders, search 2,750+ tradeable items with icons, bulk-adjust buy/sell multipliers, toggle tradeability/stock rules, and import/export economy presets safely with atomic file writes.
 
@@ -142,7 +155,7 @@ LGSS Manager is engineered as a hybrid native + asynchronous desktop stack acros
 
 ## Getting Started & Installation
 
-1. Download **`LGSS-Manager-Setup-1.3.36.exe`** from the **[Official Releases Page](https://github.com/4UR3X/ScumServerManager/releases/latest)**.
+1. Download **`LGSS-Manager-Setup-1.3.59.exe`** from the **[Official Releases Page](https://github.com/4UR3X/ScumServerManager/releases/latest)**.
 2. Run the installer on **Windows 10 / 11** or **Windows Server 2019 / 2022 / 2025 (x64)** with Administrator privileges.
 3. Select your root management workspace folder on first launch, then either **install a fresh SCUM Dedicated Server via SteamCMD** or **import an existing server directory**.
 4. Open the **RCON** tab (Native Source RCON activates automatically on server launch) and configure **Discord**, **Automation**, and **Remote API** modules as needed.
